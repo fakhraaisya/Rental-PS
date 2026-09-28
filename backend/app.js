@@ -3,9 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 
-const SUPABASE_URL = 'https://clxskbmlsaunjixybzst.supabase.co';
-const SUPABASE_PUBLISHED_KEY = 'sb_publishable_tZ_WeABf_RthbLNkLGza4g_GXuQP9hL';
-const PORT = 3000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_PUBLISHED_KEY = process.env.SUPABASE_PUBLISHED_KEY;
+const PORT = Number(process.env.PORT) || 3000;
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 const jsonHeaders = { 'Content-Type': 'application/json', apikey: SUPABASE_PUBLISHED_KEY, Authorization: `Bearer ${SUPABASE_PUBLISHED_KEY}` };
 
@@ -219,4 +219,10 @@ function serveStatic(request, response) {
   fs.readFile(filePath, (error, content) => { if (error) return response.writeHead(404).end('Not found'); const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' }; response.writeHead(200, { 'Content-Type': types[path.extname(filePath)] || 'text/plain' }); response.end(content); });
 }
 
-http.createServer((request, response) => request.url.startsWith('/api/') ? route(request, response) : serveStatic(request, response)).listen(PORT, () => console.log(`Rental revenue app: http://localhost:${PORT}`));
+http.createServer((request, response) =>
+  request.url.startsWith('/api/')
+    ? route(request, response)
+    : serveStatic(request, response)
+).listen(PORT, '0.0.0.0', () => {
+  console.log(`Rental revenue app running on port ${PORT}`);
+});
