@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PlayLedger | Transaksi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-page="rentals">
+  <div class="app-shell">
+    <main class="main-panel transaction-page">
+      <header class="topbar transaction-topbar">
+        <div>
+          <p class="eyebrow">PlayLedger / Operasional</p>
+          <h1>Transaksi penyewaan</h1>
+          <small class="muted">Kelola sesi rental, tagihan, dan status pembayaran secara terstruktur.</small>
+        </div>
+        <div class="toolbar-actions">
+          <button class="secondary-btn" id="refresh-page"><i data-lucide="refresh-cw" aria-hidden="true"></i> Refresh</button>
+          <button class="primary-btn" id="open-rental"><i data-lucide="plus" aria-hidden="true"></i> Catat transaksi</button>
+        </div>
+      </header>
+
+      <section class="transaction-summary">
+        <article class="transaction-summary-card summary-blue"><div class="summary-icon"><i data-lucide="receipt-text" aria-hidden="true"></i></div><div><span>Total transaksi</span><strong id="rental-count-page">0</strong><small>Hasil pada daftar</small></div></article>
+        <article class="transaction-summary-card summary-pink"><div class="summary-icon"><i data-lucide="banknote" aria-hidden="true"></i></div><div><span>Total pendapatan</span><strong id="transaction-value">Rp 0</strong><small>Nilai seluruh tagihan</small></div></article>
+        <article class="transaction-summary-card summary-green"><div class="summary-icon"><i data-lucide="circle-check" aria-hidden="true"></i></div><div><span>Total dibayar</span><strong id="transaction-paid">Rp 0</strong><small>Kas sudah diterima</small></div></article>
+        <article class="transaction-summary-card summary-orange"><div class="summary-icon"><i data-lucide="clock-3" aria-hidden="true"></i></div><div><span>Total piutang</span><strong id="transaction-receivable">Rp 0</strong><small>Sisa pembayaran</small></div></article>
+      </section>
+
+      <section class="card transaction-table-card">
+        <div class="card-head transaction-card-head">
+          <div><p class="eyebrow">Daftar sewa</p><h3>Semua transaksi</h3></div>
+          <span class="live-label"><i></i> Data Supabase</span>
+        </div>
+        <div class="transaction-toolbar">
+          <label class="search-control"><i data-lucide="search" aria-hidden="true"></i><input id="rental-search" type="search" placeholder="Cari ID, pelanggan, atau unit..." aria-label="Cari transaksi"></label>
+          <label class="filter-control"><i data-lucide="list-filter" aria-hidden="true"></i><select id="rental-status" aria-label="Filter status sewa"><option value="">Semua status sewa</option><option>Berlangsung</option><option>Selesai</option><option>Dibatalkan</option></select></label>
+          <button class="secondary-btn toolbar-refresh" id="refresh-page"><i data-lucide="rotate-cw" aria-hidden="true"></i> Refresh</button>
+        </div>
+        <div class="table-wrap transaction-table-wrap">
+          <table class="transaction-table">
+            <thead><tr><th>ID Transaksi</th><th>Pelanggan</th><th>Unit PlayStation</th><th>Durasi</th><th>Total</th><th>Bayar</th><th>Piutang</th><th>Pembayaran</th><th>Sewa</th><th>Aksi</th></tr></thead>
+            <tbody id="rental-list"><tr><td colspan="10" class="table-state loading-state"><span class="loading-dot"></span> Memuat transaksi...</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <dialog id="rental-modal" class="transaction-form-dialog">
+    <form id="rental-form">
+      <div class="modal-head"><div><p class="eyebrow">Transaksi baru</p><h3>Catat penyewaan</h3></div><button type="button" class="close-btn" data-close="rental-modal" aria-label="Tutup"><i data-lucide="x" aria-hidden="true"></i></button></div>
+      <label>Pelanggan<select id="rental-customer" name="pelanggan_id" required></select></label>
+      <label>Unit PlayStation<select id="rental-unit" name="unit_id" required></select></label>
+      <div class="grid-2"><label>Durasi (jam)<input name="durasi_jam" type="number" min="0.5" step="0.5" required></label><label>Status<select name="status"><option value="Berlangsung">Berlangsung</option><option value="Selesai">Selesai</option></select></label></div>
+      <label>Catatan<textarea name="catatan" rows="2"></textarea></label>
+      <button class="primary-btn full" type="submit">Simpan transaksi</button>
+    </form>
+  </dialog>
+
+  <dialog id="detail-modal" class="receipt-dialog">
+    <div id="detail-content" class="detail-content"></div>
+    <button class="secondary-btn full detail-close" data-close="detail-modal">Tutup</button>
+  </dialog>
+
+  <dialog id="edit-rental-modal" class="transaction-form-dialog"><form id="edit-rental-form"><div class="modal-head"><h3>Edit transaksi</h3><button type="button" class="close-btn" data-close="edit-rental-modal" aria-label="Tutup"><i data-lucide="x" aria-hidden="true"></i></button></div><input id="edit-rental-id" name="id" type="hidden"><label>Durasi (jam)<input name="durasi_jam" type="number" min="0.5" step="0.5" required></label><label>Status<select name="status"><option>Berlangsung</option><option>Selesai</option><option>Dibatalkan</option></select></label><label>Catatan<textarea name="catatan" rows="2"></textarea></label><button class="primary-btn full" type="submit">Simpan perubahan</button></form></dialog>
+
+  <dialog id="delete-confirm-modal" class="confirm-dialog"><div class="confirm-icon"><i data-lucide="trash-2" aria-hidden="true"></i></div><h3>Hapus transaksi?</h3><p>Data transaksi ini akan dihapus dari daftar. Tindakan ini tidak dapat dibatalkan.</p><div class="confirm-actions"><button class="secondary-btn" data-close="delete-confirm-modal">Batal</button><button class="danger-btn" id="confirm-delete">Hapus transaksi</button></div></dialog>
+  <script src="/script.js"></script>
+</body>
+</html>

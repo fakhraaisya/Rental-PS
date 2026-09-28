@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PlayLedger | Paket Sewa</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-page="paket">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">PL</span>
+        <span>PlayLedger</span>
+      </div>
+      <nav class="side-nav">
+        <a href="/index.html">Ringkasan</a>
+        <a href="/transaksi.html">Transaksi</a>
+        <a class="active" href="/paket.html">Paket</a>
+        <a href="/pelanggan.html">Pelanggan</a>
+      </nav>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Page</p>
+          <h1>Paket Sewa</h1>
+        </div>
+      </header>
+
+      <section class="stats-grid page-stats">
+        <article class="stat-card"><span>Paket aktif</span><strong id="package-total">0</strong><small>Pilihan tersedia</small></article>
+        <article class="stat-card"><span>Harga terendah</span><strong id="package-min">Rp 0</strong><small>Mulai dari per jam</small></article>
+        <article class="stat-card"><span>Harga tertinggi</span><strong id="package-max">Rp 0</strong><small>Paket premium</small></article>
+        <article class="stat-card"><span>Rata-rata harga</span><strong id="package-average">Rp 0</strong><small>Seluruh paket</small></article>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Daftar</p>
+            <h3>Jenis paket</h3>
+          </div>
+          <input id="package-search" class="search-input" type="search" placeholder="Cari paket atau konsol...">
+        </div>
+        <div id="package-list" class="list-stack"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/script.js"></script>
+</body>
+</html>
