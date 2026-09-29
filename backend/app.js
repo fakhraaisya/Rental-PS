@@ -76,6 +76,24 @@ async function getReportRows() {
   return supabaseRequest('v_laporan_pendapatan', { query: { select: '*', order: 'mulai_sewa.desc' } });
 }
 
+async function getUnitsWithRates() {
+  const [units, tariffs] = await Promise.all([
+    supabaseRequest('unit_playstation', { query: { select: '*', order: 'kode_unit.asc' } }),
+    supabaseRequest('tarif_konsol', { query: { select: 'tipe_konsol,tarif_per_jam' } }),
+  ]);
+  const ratesByType = Object.fromEntries(tariffs.map((row) => [row.tipe_konsol, Number(row.tarif_per_jam)]));
+  return units.map((unit) => ({ ...unit, tarif_per_jam: ratesByType[unit.tipe_konsol] }));
+}
+
+async function getRoomsWithRates() {
+  const [rooms, tariffs] = await Promise.all([
+    supabaseRequest('ruangan', { query: { select: '*', order: 'kode_ruangan.asc' } }),
+    supabaseRequest('tarif_ruangan', { query: { select: 'tipe_ruangan,tarif_per_jam' } }),
+  ]);
+  const ratesByType = Object.fromEntries(tariffs.map((row) => [row.tipe_ruangan, Number(row.tarif_per_jam)]));
+  return rooms.map((room) => ({ ...room, tarif_per_jam: ratesByType[room.tipe_ruangan] }));
+}
+
 async function getDashboard(requestUrl) {
   const range = getDateRange(requestUrl);
   const [rows, units, customers] = await Promise.all([
@@ -129,6 +147,14 @@ async function validateUnitAvailable(unitId) {
   return rows[0];
 }
 
+async function validateRoomAvailable(roomId) {
+  if (!roomId) return null;
+  const rows = await supabaseRequest('ruangan', { query: { select: '*', id: `eq.${roomId}` } });
+  if (!rows[0]) throw new HttpError(400, 'Ruangan tidak ditemukan.');
+  if (rows[0].status !== 'Tersedia') throw new HttpError(409, `Ruangan sedang ${rows[0].status.toLowerCase()} dan tidak dapat disewa.`);
+  return rows[0];
+}
+
 async function route(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const pathParts = requestUrl.pathname.split('/').filter(Boolean);
@@ -143,7 +169,9 @@ async function route(request, response) {
       return send(200, (await getReportRows()).filter((row) => isInRange(row.mulai_sewa, range)));
     }
     if (request.method === 'GET' && resource === 'customers') return send(200, await supabaseRequest('pelanggan', { query: { select: '*', order: 'nama.asc' } }));
-    if (request.method === 'GET' && resource === 'units') return send(200, await supabaseRequest('unit_playstation', { query: { select: '*', order: 'kode_unit.asc' } }));
+    if (request.method === 'GET' && resource === 'units') return send(200, await getUnitsWithRates());
+    if (request.method === 'GET' && resource === 'rooms') return send(200, await getRoomsWithRates());
+    if (request.method === 'GET' && resource === 'tariffs') return send(200, await supabaseRequest('tarif_konsol', { query: { select: '*', order: 'tipe_konsol.asc' } }));
     if (request.method === 'GET' && resource === 'rentals') return send(200, await getReportRows());
     if (request.method === 'GET' && resource === 'payments') return send(200, await getReportRows());
 
@@ -161,8 +189,15 @@ async function route(request, response) {
 
     if (request.method === 'POST' && resource === 'units') {
       const body = await parseBody(request);
-      if (!body.kode_unit || !body.nama_unit || !Number(body.tarif_per_jam) || Number(body.tarif_per_jam) <= 0) throw new HttpError(400, 'Kode, nama, dan tarif unit wajib valid.');
-      return send(201, (await supabaseRequest('unit_playstation', { method: 'POST', body: { kode_unit: body.kode_unit.trim(), nama_unit: body.nama_unit.trim(), tipe_konsol: body.tipe_konsol || 'PS4', tarif_per_jam: Number(body.tarif_per_jam), status: body.status || 'Tersedia', catatan: body.catatan || null } }))[0]);
+      const consoleType = body.tipe_konsol || 'PS4';
+      if (!body.kode_unit || !body.nama_unit || !['PS4', 'PS5'].includes(consoleType)) throw new HttpError(400, 'Kode, nama, dan tipe konsol wajib valid.');
+      return send(201, (await supabaseRequest('unit_playstation', { method: 'POST', body: { kode_unit: body.kode_unit.trim(), nama_unit: body.nama_unit.trim(), tipe_konsol: consoleType, status: body.status || 'Tersedia', catatan: body.catatan || null } }))[0]);
+    }
+    if (request.method === 'PATCH' && resource === 'tariffs' && id) {
+      const body = await parseBody(request);
+      const amount = Number(body.tarif_per_jam);
+      if (!['PS4', 'PS5'].includes(id) || !Number.isFinite(amount) || amount <= 0) throw new HttpError(400, 'Tipe konsol atau tarif tidak valid.');
+      return send(200, (await supabaseRequest('tarif_konsol', { method: 'PATCH', query: { tipe_konsol: `eq.${id}` }, body: { tarif_per_jam: amount } }))[0]);
     }
     if (request.method === 'PATCH' && resource === 'units' && id) return send(200, (await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${id}` }, body: await parseBody(request) }))[0]);
     if (request.method === 'DELETE' && resource === 'units' && id) return send(204, await supabaseRequest('unit_playstation', { method: 'DELETE', query: { id: `eq.${id}` } }));
@@ -178,19 +213,53 @@ async function route(request, response) {
       if (!body.pelanggan_id || !body.unit_id || !Number.isFinite(duration) || duration <= 0) throw new HttpError(400, 'Pelanggan, unit, dan durasi lebih dari nol wajib diisi.');
       await validateCustomer(body.pelanggan_id);
       const unit = await validateUnitAvailable(body.unit_id);
+      const roomId = body.ruangan_id || null;
+      const room = await validateRoomAvailable(roomId);
       const status = body.status || 'Berlangsung';
-      const total = Number((unit.tarif_per_jam * duration).toFixed(2));
-      const rental = (await supabaseRequest('penyewaan', { method: 'POST', body: { kode_penyewaan: body.kode_penyewaan || `SEWA-${Date.now().toString().slice(-8)}`, pelanggan_id: body.pelanggan_id, unit_id: body.unit_id, mulai_sewa: body.mulai_sewa || new Date().toISOString(), durasi_jam: duration, tarif_per_jam: unit.tarif_per_jam, total_biaya: total, status, catatan: body.catatan || null } }))[0];
-      if (status === 'Berlangsung') await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${unit.id}` }, body: { status: 'Disewa' } });
+      const tariffRows = await supabaseRequest('tarif_konsol', { query: { select: 'tarif_per_jam', tipe_konsol: `eq.${unit.tipe_konsol}` } });
+      const hourlyRate = Number(tariffRows[0]?.tarif_per_jam);
+      if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) throw new HttpError(400, `Tarif ${unit.tipe_konsol} tidak ditemukan.`);
+      const roomRate = room ? Number((await supabaseRequest('tarif_ruangan', { query: { select: 'tarif_per_jam', tipe_ruangan: `eq.${room.tipe_ruangan}` } }))[0]?.tarif_per_jam || 0) : 0;
+      if (room && roomRate <= 0) throw new HttpError(400, `Tarif ruang ${room.tipe_ruangan} tidak ditemukan.`);
+      const total = Number(((hourlyRate + roomRate) * duration).toFixed(2));
+      const rental = (await supabaseRequest('penyewaan', { method: 'POST', body: { kode_penyewaan: body.kode_penyewaan || `SEWA-${Date.now().toString().slice(-8)}`, pelanggan_id: body.pelanggan_id, unit_id: body.unit_id, ruangan_id: roomId, mulai_sewa: body.mulai_sewa || new Date().toISOString(), durasi_jam: duration, tarif_per_jam: hourlyRate, tarif_ruangan_per_jam: roomRate, total_biaya: total, status, catatan: body.catatan || null } }))[0];
+      if (status === 'Berlangsung') {
+        await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${unit.id}` }, body: { status: 'Disewa' } });
+        if (room) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${room.id}` }, body: { status: 'Disewa' } });
+      }
       if (Number(body.jumlah_bayar) > 0) await savePayment(rental.id, Number(body.jumlah_bayar), body.metode_pembayaran || 'Tunai');
       return send(201, rental);
     }
     if (request.method === 'PATCH' && resource === 'rentals' && id) {
       const body = await parseBody(request);
       if (body.durasi_jam !== undefined && Number(body.durasi_jam) <= 0) throw new HttpError(400, 'Durasi harus lebih dari nol.');
-      return send(200, (await supabaseRequest('penyewaan', { method: 'PATCH', query: { id: `eq.${id}` }, body }))[0]);
+      const current = (await supabaseRequest('penyewaan', { query: { select: 'unit_id,ruangan_id,status,tarif_per_jam,tarif_ruangan_per_jam', id: `eq.${id}` } }))[0];
+      if (!current) throw new HttpError(404, 'Transaksi penyewaan tidak ditemukan.');
+      if (body.durasi_jam !== undefined) body.total_biaya = Number((Number(body.durasi_jam) * (Number(current.tarif_per_jam) + Number(current.tarif_ruangan_per_jam || 0))).toFixed(2));
+      if (current.status !== 'Berlangsung' && body.status === 'Berlangsung') {
+        await validateUnitAvailable(current.unit_id);
+        await validateRoomAvailable(current.ruangan_id);
+      }
+      const updated = (await supabaseRequest('penyewaan', { method: 'PATCH', query: { id: `eq.${id}` }, body }))[0];
+      if (current.status !== 'Berlangsung' && body.status === 'Berlangsung') {
+        await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${current.unit_id}` }, body: { status: 'Disewa' } });
+        if (current.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${current.ruangan_id}` }, body: { status: 'Disewa' } });
+      }
+      if (current.status === 'Berlangsung' && body.status && body.status !== 'Berlangsung') {
+        await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${current.unit_id}` }, body: { status: 'Tersedia' } });
+        if (current.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${current.ruangan_id}` }, body: { status: 'Tersedia' } });
+      }
+      return send(200, updated);
     }
-    if (request.method === 'DELETE' && resource === 'rentals' && id) return send(204, await supabaseRequest('penyewaan', { method: 'DELETE', query: { id: `eq.${id}` } }));
+    if (request.method === 'DELETE' && resource === 'rentals' && id) {
+      const current = (await supabaseRequest('penyewaan', { query: { select: 'unit_id,ruangan_id,status', id: `eq.${id}` } }))[0];
+      await supabaseRequest('penyewaan', { method: 'DELETE', query: { id: `eq.${id}` } });
+      if (current?.status === 'Berlangsung') {
+        await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${current.unit_id}` }, body: { status: 'Tersedia' } });
+        if (current.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${current.ruangan_id}` }, body: { status: 'Tersedia' } });
+      }
+      return send(204, null);
+    }
 
     if (request.method === 'POST' && resource === 'payments') {
       const body = await parseBody(request);
@@ -216,7 +285,7 @@ function serveStatic(request, response) {
   const relative = requested === '/' ? 'index.html' : requested.replace(/^\//, '');
   const filePath = path.normalize(path.join(FRONTEND_DIR, relative));
   if (!filePath.startsWith(FRONTEND_DIR)) return response.writeHead(403).end();
-  fs.readFile(filePath, (error, content) => { if (error) return response.writeHead(404).end('Not found'); const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' }; response.writeHead(200, { 'Content-Type': types[path.extname(filePath)] || 'text/plain' }); response.end(content); });
+  fs.readFile(filePath, (error, content) => { if (error) return response.writeHead(404).end('Not found'); const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml' }; response.writeHead(200, { 'Content-Type': types[path.extname(filePath)] || 'text/plain' }); response.end(content); });
 }
 
 http.createServer((request, response) =>
