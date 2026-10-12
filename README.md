@@ -21,6 +21,16 @@ Data transaksi yang dicatat dalam sistem digunakan untuk menghitung total pendap
 | Grafik | Chart.js |
 | Bahasa | JavaScript |
 
+## Deployment GitHub Pages
+
+GitHub Pages hanya menyajikan berkas statis. Frontend mengirim permintaan langsung ke Supabase REST; backend Node.js tidak perlu dijalankan untuk deployment Pages. Project URL dan Publishable Key berada di bagian awal `frontend/script.js`. Isi keduanya dari **Supabase Project Settings → API** dan gunakan hanya URL project serta Publishable Key (`sb_publishable_...`) atau legacy anon key. Jangan pernah menaruh `service_role` atau secret key di frontend.
+
+Project URL yang dikonfigurasi saat ini telah berhasil diuji melalui Supabase REST. Jika project diganti, perbarui nilai URL dengan Project URL aktif dari dashboard Supabase dan uji endpoint REST sebelum deploy; jangan menebak project ref berdasarkan nama repository.
+
+Untuk database yang sudah ada, jalankan `database/migrate_pages_rest_permissions.sql` satu kali di Supabase SQL Editor. Migrasi ini hanya memberi grant REST yang sesuai dengan policy `anon` di schema dan tidak mengubah isi tabel. `database/schema.sql` berisi data demo serta logika kompatibilitas yang menghapus pembayaran legacy tertentu; jangan jalankan ulang pada database berisi data asli tanpa meninjau seluruh skrip terlebih dahulu.
+
+Periksa **Project Settings → API → CORS** bila browser memblokir permintaan dari domain Pages. Jika respons REST `401`/`403`, periksa Publishable Key, grant, dan policy RLS; jika hostname gagal di-resolve, pastikan Project URL tepat dan project masih aktif. Schema saat ini memberi role `anon` akses CRUD terbuka untuk kebutuhan demo. Untuk data pelanggan sungguhan, aktifkan autentikasi dan batasi policy sebelum memublikasikan aplikasi.
+
 ## Fitur
 
 | **Menu** | **Isi** |

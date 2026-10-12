@@ -1,909 +1,264 @@
 const pageName = document.body.dataset.page || 'dashboard';
-const state = { customers: [], units: [], tariffs: [], rooms: [], rentals: [], payments: [], period: 'month', chartPeriod: '7', dashboard: null, pendingDelete: null, revenueChart: null, chartJsPromise: null };
+const state = { customers: [], units: [], rentals: [], payments: [], period: 'month', chartPeriod: '7', dashboard: null, pendingDelete: null, revenueChart: null, chartJsPromise: null };
+const SUPABASE_URL = 'https://clxskbmlsaunjixybzst.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_tZ_WeABf_RthbLNkLGza4g_GXuQP9hL';
 const $ = (selector) => document.querySelector(selector);
 const formatRupiah = (value) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(Number(value || 0));
 const formatDate = (value) => value ? new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '-';
 const formatDateOnly = (value) => value ? new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium' }).format(new Date(value)) : '-';
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[character]));
 
-const SUPABASE_URL = 'https://clxskbmlsaunjixybzst.supabase.co';
-const SUPABASE_PUBLISHED_KEY = 'sb_publishable_tZ_WeABf_RthbLNkLGza4g_GXuQP9hL';
-
-const supabaseHeaders = {
-  'Content-Type': 'application/json',
-  'apikey': SUPABASE_PUBLISHED_KEY,
-  'Authorization': `Bearer ${SUPABASE_PUBLISHED_KEY}`
-};
-
-async function supabaseRequest(table, options = {}) {
+async function supabaseRequest(table, { method = 'GET', query = {}, body, prefer } = {}) {
   const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
-
-  Object.entries(options.query || {}).forEach(([key, value]) => {
-    url.searchParams.set(key, value);
-  });
-
-  const headers = {
-    ...supabaseHeaders
-  };
-
-  if (options.body) {
-    headers.Prefer = options.prefer || 'return=representation';
+  Object.entries(query).forEach(([key, value]) => url.searchParams.set(key, value));
+  const headers = { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${SUPABASE_PUBLISHABLE_KEY}` };
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    headers.Prefer = prefer || 'return=representation';
   }
-
-  const response = await fetch(url, {
-    method: options.method || 'GET',
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-
-  const text = await response.text();
-
-  let data;
+  let response;
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
+    response = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (error) {
+    throw new Error(`Tidak dapat terhubung ke Supabase (${error.message}). Periksa URL project, koneksi internet, dan konfigurasi API project.`);
   }
-
+  const text = await response.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!response.ok) {
-    throw new Error(
-      data?.message ||
-      data?.hint ||
-      `Supabase error ${response.status}`
-    );
+    const detail = data?.message || data?.details || data?.hint || text || `HTTP ${response.status}`;
+    const accessHint = response.status === 401 || response.status === 403 ? ' Periksa Publishable Key, grant tabel, dan policy RLS untuk role anon.' : '';
+    throw new Error(`Supabase ${response.status}: ${detail}${accessHint}`);
   }
-
   return data;
 }
+async function supabaseRows(table, query = {}) {
+  const pageSize = 1000;
+  const rows = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await supabaseRequest(table, { query: { ...query, limit: String(pageSize), offset: String(offset) } });
+    rows.push(...page);
+    if (page.length < pageSize) return rows;
+  }
+}
 
-function calculatePaymentStatus(total, paid) {
+function readPayload(options) {
+  if (!options.body) return {};
+  try { return JSON.parse(options.body); } catch { throw new Error('Format data formulir tidak valid.'); }
+}
+function periodBounds(params) {
+  const period = params.get('period') || 'month';
+  const now = new Date();
+  const start = new Date(now);
+  const end = new Date(now);
+  if (period === 'all') return { start: new Date(0), end };
+  if (period === 'today') start.setHours(0, 0, 0, 0);
+  else if (period === 'week') {
+    const day = start.getDay() || 7;
+    start.setDate(start.getDate() - day + 1);
+    start.setHours(0, 0, 0, 0);
+  } else if (period === 'month') {
+    start.setDate(1);
+    start.setHours(0, 0, 0, 0);
+  } else if (period === 'custom') {
+    const from = params.get('start');
+    const through = params.get('end');
+    if (!from || !through || from > through) throw new Error('Periode custom membutuhkan tanggal mulai dan selesai yang valid.');
+    start.setTime(new Date(`${from}T00:00:00`).getTime());
+    end.setTime(new Date(`${through}T23:59:59.999`).getTime());
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) throw new Error('Tanggal periode custom tidak valid.');
+  }
+  return { start, end };
+}
+function inPeriod(value, bounds) {
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date >= bounds.start && date <= bounds.end;
+}
+function paymentStatus(total, paid) {
   if (paid <= 0) return 'Belum Lunas';
   if (paid >= total) return 'Lunas';
   return 'Sebagian';
 }
-
-async function getReportRows() {
-  return supabaseRequest('v_laporan_pendapatan', {
-    query: {
-      select: '*',
-      order: 'mulai_sewa.desc'
-    }
-  });
+function reportRowsForPeriod(rows, params) {
+  const bounds = periodBounds(params);
+  return rows.filter((row) => inPeriod(row.mulai_sewa, bounds));
 }
-
-async function getUnitsWithRates() {
-  const [units, tariffs] = await Promise.all([
-    supabaseRequest('unit_playstation', {
-      query: { select: '*', order: 'kode_unit.asc' }
-    }),
-    supabaseRequest('tarif_konsol', {
-      query: { select: 'tipe_konsol,tarif_per_jam' }
-    })
+async function getUnits() {
+  const rows = await supabaseRows('unit_playstation', { select: '*,tarif_konsol(tarif_per_jam)', order: 'kode_unit.asc' });
+  return rows.map((row) => ({ ...row, tarif_per_jam: Number(row.tarif_konsol?.tarif_per_jam || 0) }));
+}
+async function getDashboard(params) {
+  const [allRows, units, customers] = await Promise.all([
+    supabaseRows('v_laporan_pendapatan', { select: '*', order: 'mulai_sewa.desc,id.asc' }),
+    supabaseRows('unit_playstation', { select: 'id,status', order: 'id.asc' }),
+    supabaseRows('pelanggan', { select: 'id,aktif', order: 'id.asc' }),
   ]);
-  const ratesByType = Object.fromEntries(
-    tariffs.map((row) => [row.tipe_konsol, Number(row.tarif_per_jam)])
-  );
-  return units.map((unit) => ({
-    ...unit,
-    tarif_per_jam: ratesByType[unit.tipe_konsol]
-  }));
-}
-
-async function getRoomsWithRates() {
-  const [rooms, tariffs] = await Promise.all([
-    supabaseRequest('ruangan', {
-      query: { select: '*', order: 'kode_ruangan.asc' }
-    }),
-    supabaseRequest('tarif_ruangan', {
-      query: { select: 'tipe_ruangan,tarif_per_jam' }
-    })
-  ]);
-  const ratesByType = Object.fromEntries(
-    tariffs.map((row) => [row.tipe_ruangan, Number(row.tarif_per_jam)])
-  );
-  return rooms.map((room) => ({
-    ...room,
-    tarif_per_jam: ratesByType[room.tipe_ruangan]
-  }));
-}
-
-function getDateRangeFromEndpoint(endpoint) {
-  const queryString = endpoint.includes('?')
-    ? endpoint.split('?')[1]
-    : '';
-
-  const params = new URLSearchParams(queryString);
-
-  const period = params.get('period') || 'month';
-
-  const now = new Date();
-  const start = new Date(now);
-  const end = new Date(now);
-
-  if (period === 'all') {
-    start.setTime(0);
-    return { period, start, end };
-  }
-
-  if (period === 'today') {
-    start.setHours(0, 0, 0, 0);
-  }
-
-  if (period === 'week') {
-    const day = start.getDay() || 7;
-    start.setDate(start.getDate() - day + 1);
-    start.setHours(0, 0, 0, 0);
-  }
-
-  if (period === 'month') {
-    start.setDate(1);
-    start.setHours(0, 0, 0, 0);
-  }
-
-  if (period === 'custom') {
-    const customStart = params.get('start');
-    const customEnd = params.get('end');
-
-    if (!customStart || !customEnd) {
-      throw new Error(
-        'Periode custom membutuhkan tanggal mulai dan selesai.'
-      );
-    }
-
-    start.setTime(
-      new Date(`${customStart}T00:00:00`).getTime()
-    );
-
-    end.setTime(
-      new Date(`${customEnd}T23:59:59`).getTime()
-    );
-  }
-
-  return { period, start, end };
-}
-
-function isInRange(value, range) {
-  const date = new Date(value);
-
-  return (
-    !Number.isNaN(date.getTime()) &&
-    date >= range.start &&
-    date <= range.end
-  );
-}
-
-async function getDashboardFromSupabase(endpoint) {
-  const range = getDateRangeFromEndpoint(endpoint);
-
-  const [rows, units, customers] = await Promise.all([
-    getReportRows(),
-    supabaseRequest('unit_playstation', {
-      query: {
-        select: '*'
-      }
-    }),
-    supabaseRequest('pelanggan', {
-      query: {
-        select: 'id,nama,aktif'
-      }
-    })
-  ]);
-
-  const filteredRows = rows.filter((row) =>
-    isInRange(row.mulai_sewa, range)
-  );
-
-  const totalBilled = filteredRows.reduce(
-    (sum, row) => sum + Number(row.total_biaya || 0),
-    0
-  );
-
-  const totalPaid = filteredRows.reduce(
-    (sum, row) =>
-      sum +
-      Math.min(
-        Number(row.jumlah_bayar || 0),
-        Number(row.total_biaya || 0)
-      ),
-    0
-  );
-
-  const totalReceivable = Math.max(
-    totalBilled - totalPaid,
-    0
-  );
-
+  const bounds = periodBounds(params);
+  const rows = allRows.filter((row) => inPeriod(row.mulai_sewa, bounds));
+  const paidRows = allRows.filter((row) => Number(row.jumlah_bayar || 0) > 0 && inPeriod(row.tanggal_bayar, bounds));
+  const totalBilled = rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0);
+  const totalPaid = paidRows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0);
+  const paidForPeriodBillings = rows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0);
+  const totalReceivable = rows.reduce((sum, row) => sum + Number(row.piutang || 0), 0);
   const consoleMap = {};
   const paymentMap = {};
   const customerMap = {};
-
-  filteredRows.forEach((row) => {
-    const paid = Math.min(
-      Number(row.jumlah_bayar || 0),
-      Number(row.total_biaya || 0)
-    );
-
-    consoleMap[row.tipe_konsol] =
-      (consoleMap[row.tipe_konsol] || 0) +
-      Number(row.total_biaya || 0);
-
-    customerMap[row.nama_pelanggan] =
-      (customerMap[row.nama_pelanggan] || 0) +
-      Number(row.total_biaya || 0);
-
-    if (row.metode_pembayaran) {
-      paymentMap[row.metode_pembayaran] =
-        (paymentMap[row.metode_pembayaran] || 0) +
-        paid;
-    }
+  rows.forEach((row) => {
+    const billed = Number(row.total_biaya || 0);
+    consoleMap[row.tipe_konsol] = (consoleMap[row.tipe_konsol] || 0) + billed;
+    customerMap[row.nama_pelanggan] = (customerMap[row.nama_pelanggan] || 0) + billed;
   });
-
+  paidRows.forEach((row) => {
+    if (row.metode_pembayaran) paymentMap[row.metode_pembayaran] = (paymentMap[row.metode_pembayaran] || 0) + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0));
+  });
+  const summarize = (map) => Object.entries(map).map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount);
   return {
-    period: range.period,
-    updatedAt: new Date().toISOString(),
-
-    collectedRevenue: totalPaid,
-    totalBilled,
-    totalReceivable,
-
-    customerCount: customers.filter(
-      (item) => item.aktif !== false
-    ).length,
-
-    transactionCount: filteredRows.length,
-
-    completedSessions: filteredRows.filter(
-      (row) => row.status === 'Selesai'
-    ).length,
-
-    activeSessions: filteredRows.filter(
-      (row) => row.status === 'Berlangsung'
-    ),
-
-    totalHours: filteredRows.reduce(
-      (sum, row) =>
-        sum + Number(row.durasi_jam || 0),
-      0
-    ),
-
-    averageTransaction: filteredRows.length
-      ? totalBilled / filteredRows.length
-      : 0,
-
-    paymentRate: totalBilled
-      ? Math.round((totalPaid / totalBilled) * 100)
-      : 0,
-
+    period: params.get('period') || 'month', updatedAt: new Date().toISOString(), collectedRevenue: totalPaid,
+    totalBilled, totalReceivable, customerCount: customers.filter((item) => item.aktif !== false).length,
+    transactionCount: rows.length, completedSessions: rows.filter((row) => row.status === 'Selesai').length,
+    activeSessions: rows.filter((row) => row.status === 'Berlangsung'),
+    totalHours: rows.reduce((sum, row) => sum + Number(row.durasi_jam || 0), 0),
+    averageTransaction: rows.length ? totalBilled / rows.length : 0,
+    paymentRate: totalBilled ? Math.round((paidForPeriodBillings / totalBilled) * 100) : 0,
     unitSummary: {
-      available: units.filter(
-        (item) => item.status === 'Tersedia'
-      ).length,
-
-      rented: units.filter(
-        (item) => item.status === 'Disewa'
-      ).length,
-
-      maintenance: units.filter(
-        (item) => item.status === 'Perawatan'
-      ).length,
-
-      total: units.length
+      available: units.filter((item) => item.status === 'Tersedia').length,
+      rented: units.filter((item) => item.status === 'Disewa').length,
+      maintenance: units.filter((item) => item.status === 'Perawatan').length,
+      total: units.length,
     },
-
-    consoleBreakdown: Object.entries(consoleMap)
-      .map(([name, amount]) => ({
-        name,
-        amount
-      }))
-      .sort((a, b) => b.amount - a.amount),
-
-    paymentBreakdown: Object.entries(paymentMap)
-      .map(([name, amount]) => ({
-        name,
-        amount
-      }))
-      .sort((a, b) => b.amount - a.amount),
-
-    topCustomers: Object.entries(customerMap)
-      .map(([name, amount]) => ({
-        name,
-        amount
-      }))
-      .sort((a, b) => b.amount - a.amount)
-      .slice(0, 5),
-
-    recentTransactions: rows.slice(0, 8)
+    consoleBreakdown: summarize(consoleMap), paymentBreakdown: summarize(paymentMap),
+    topCustomers: summarize(customerMap).slice(0, 5), recentTransactions: allRows.slice(0, 8),
   };
 }
-
-async function savePaymentDirect(
-  rentalId,
-  amount,
-  method,
-  note = null
-) {
-  const rentalRows = await supabaseRequest(
-    'penyewaan',
-    {
-      query: {
-        select: 'id,total_biaya',
-        id: `eq.${rentalId}`
-      }
-    }
-  );
-
-  const rental = rentalRows[0];
-
-  if (!rental) {
-    throw new Error(
-      'Transaksi penyewaan tidak ditemukan.'
-    );
+async function saveCustomer(payload) {
+  if (!payload.nama || payload.nama.trim().length < 2) throw new Error('Nama pelanggan minimal 2 karakter.');
+  return (await supabaseRequest('pelanggan', { method: 'POST', body: {
+    nama: payload.nama.trim(), nomor_telepon: payload.nomor_telepon?.trim() || null,
+    email: payload.email?.trim() || null, aktif: true,
+  } }))[0];
+}
+async function saveUnit(payload) {
+  const tipe = payload.tipe_konsol || 'PS4';
+  const rate = Number(payload.tarif_per_jam);
+  if (!payload.kode_unit?.trim() || !payload.nama_unit?.trim()) throw new Error('Kode dan nama unit wajib diisi.');
+  if (Number.isFinite(rate) && rate > 0) {
+    const existing = await supabaseRequest('tarif_konsol', { query: { select: 'tipe_konsol', tipe_konsol: `eq.${tipe}` } });
+    if (existing.length) await supabaseRequest('tarif_konsol', { method: 'PATCH', query: { tipe_konsol: `eq.${tipe}` }, body: { tarif_per_jam: rate } });
+    else await supabaseRequest('tarif_konsol', { method: 'POST', body: { tipe_konsol: tipe, tarif_per_jam: rate } });
   }
-
-  const total = Number(rental.total_biaya);
-
+  const { tarif_per_jam, ...unit } = payload;
+  return (await supabaseRequest('unit_playstation', { method: 'POST', body: {
+    kode_unit: unit.kode_unit.trim(), nama_unit: unit.nama_unit.trim(), tipe_konsol: tipe,
+    status: unit.status || 'Tersedia', catatan: unit.catatan || null,
+  } }))[0];
+}
+async function saveRental(payload) {
+  let customerId = payload.pelanggan_id;
+  if (customerId === '__new__') {
+    if (!payload.customer_name || payload.customer_name.trim().length < 2) throw new Error('Nama pelanggan baru minimal 2 karakter.');
+    customerId = (await saveCustomer({ nama: payload.customer_name, nomor_telepon: payload.customer_phone, email: payload.customer_email })).id;
+  }
+  const duration = Number(payload.durasi_jam);
+  if (!customerId || !payload.unit_id || !Number.isFinite(duration) || duration <= 0) throw new Error('Pelanggan, unit, dan durasi lebih dari nol wajib diisi.');
+  const [customers, units] = await Promise.all([
+    supabaseRequest('pelanggan', { query: { select: 'id', id: `eq.${customerId}`, aktif: 'eq.true' } }),
+    supabaseRequest('unit_playstation', { query: { select: 'id,status', id: `eq.${payload.unit_id}` } }),
+  ]);
+  if (!customers.length) throw new Error('Pelanggan aktif tidak ditemukan.');
+  if (!units.length) throw new Error('Unit PlayStation tidak ditemukan.');
+  if (units[0].status !== 'Tersedia') throw new Error(`Unit sedang ${units[0].status.toLowerCase()} dan tidak dapat disewa.`);
+  const rentalPayload = {
+    kode_penyewaan: payload.kode_penyewaan || `SEWA-${Date.now().toString().slice(-8)}`,
+    pelanggan_id: customerId, unit_id: payload.unit_id, ruangan_id: payload.ruangan_id || null,
+    mulai_sewa: payload.mulai_sewa || new Date().toISOString(), durasi_jam: duration,
+    status: payload.status || 'Berlangsung', catatan: payload.catatan || null,
+  };
+  const rental = (await supabaseRequest('penyewaan', { method: 'POST', body: rentalPayload }))[0];
+  if (rentalPayload.status === 'Berlangsung') {
+    await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${payload.unit_id}` }, body: { status: 'Disewa' } });
+    if (rentalPayload.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${rentalPayload.ruangan_id}` }, body: { status: 'Disewa' } });
+  }
+  return rental;
+}
+async function updateRental(id, payload) {
+  const current = (await supabaseRequest('penyewaan', { query: { select: 'id,unit_id,ruangan_id,durasi_jam,tarif_per_jam,tarif_ruangan_per_jam,total_biaya,status', id: `eq.${id}` } }))[0];
+  if (!current) throw new Error('Transaksi penyewaan tidak ditemukan.');
+  const update = { ...payload };
+  if (payload.durasi_jam !== undefined) {
+    const duration = Number(payload.durasi_jam);
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error('Durasi harus lebih dari nol.');
+    update.durasi_jam = duration;
+    update.total_biaya = Number((duration * (Number(current.tarif_per_jam) + Number(current.tarif_ruangan_per_jam || 0))).toFixed(2));
+  }
+  const result = (await supabaseRequest('penyewaan', { method: 'PATCH', query: { id: `eq.${id}` }, body: update }))[0];
+  if (payload.status && payload.status !== current.status) {
+    const resourceStatus = payload.status === 'Berlangsung' ? 'Disewa' : 'Tersedia';
+    await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${current.unit_id}` }, body: { status: resourceStatus } });
+    if (current.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${current.ruangan_id}` }, body: { status: resourceStatus } });
+  }
+  return result;
+}
+async function savePayment(payload) {
+  const amount = Number(payload.jumlah_bayar);
+  if (!payload.penyewaan_id || !Number.isFinite(amount) || amount <= 0) throw new Error('Transaksi dan jumlah pembayaran wajib valid.');
+  const rental = (await supabaseRequest('penyewaan', { query: { select: 'id,total_biaya', id: `eq.${payload.penyewaan_id}` } }))[0];
+  if (!rental) throw new Error('Transaksi penyewaan tidak ditemukan.');
+  const previous = (await supabaseRequest('pembayaran', { query: { select: 'jumlah_bayar', penyewaan_id: `eq.${payload.penyewaan_id}` } }))[0];
+  const paid = Math.min(Number(rental.total_biaya), Number(previous?.jumlah_bayar || 0) + amount);
   const payment = {
-    penyewaan_id: rentalId,
-    jumlah_bayar: Math.min(amount, total),
-    metode_pembayaran: method,
-    status_pembayaran: calculatePaymentStatus(
-      total,
-      amount
-    ),
-    catatan: note
+    penyewaan_id: payload.penyewaan_id, jumlah_bayar: paid,
+    metode_pembayaran: payload.metode_pembayaran || 'Tunai',
+    status_pembayaran: paymentStatus(Number(rental.total_biaya), paid),
+    tanggal_bayar: new Date().toISOString(), catatan: payload.catatan || null,
   };
-
-  const result = await supabaseRequest(
-    'pembayaran',
-    {
-      method: 'POST',
-      body: payment,
-      prefer:
-        'resolution=merge-duplicates,return=representation'
-    }
-  );
-
-  return result[0];
+  return (await supabaseRequest('pembayaran', {
+    method: 'POST', query: { on_conflict: 'penyewaan_id' },
+    prefer: 'resolution=merge-duplicates,return=representation', body: payment,
+  }))[0];
 }
-
 async function api(endpoint, options = {}) {
+  const requestUrl = new URL(endpoint, window.location.href);
+  const [, apiPrefix, resource, id] = requestUrl.pathname.split('/');
+  if (apiPrefix !== 'api') throw new Error('Endpoint data tidak dikenal.');
   const method = options.method || 'GET';
-  const body = options.body
-    ? JSON.parse(options.body)
-    : null;
-
-  if (endpoint.startsWith('/api/dashboard')) {
-    return getDashboardFromSupabase(endpoint);
-  }
-
-  if (endpoint.startsWith('/api/report')) {
-    const range = getDateRangeFromEndpoint(endpoint);
-
-    const rows = await getReportRows();
-
-    return rows.filter((row) =>
-      isInRange(row.mulai_sewa, range)
-    );
-  }
-
-  if (endpoint === '/api/customers' && method === 'GET') {
-    return supabaseRequest('pelanggan', {
-      query: {
-        select: '*',
-        order: 'nama.asc'
-      }
-    });
-  }
-
-  if (endpoint === '/api/units' && method === 'GET') {
-    return getUnitsWithRates();
-  }
-
-  if (endpoint === '/api/rooms' && method === 'GET') {
-    return getRoomsWithRates();
-  }
-
-  if (endpoint === '/api/tariffs' && method === 'GET') {
-    return supabaseRequest('tarif_konsol', {
-      query: {
-        select: '*',
-        order: 'tipe_konsol.asc'
-      }
-    });
-  }
-
-  if (
-    (endpoint === '/api/rentals' ||
-      endpoint === '/api/payments') &&
-    method === 'GET'
-  ) {
-    return getReportRows();
-  }
-
-  if (endpoint === '/api/customers' && method === 'POST') {
-    if (!body.nama || body.nama.trim().length < 2) {
-      throw new Error(
-        'Nama pelanggan minimal 2 karakter.'
-      );
+  const payload = readPayload(options);
+  const query = Object.fromEntries(requestUrl.searchParams.entries());
+  const report = () => supabaseRows('v_laporan_pendapatan', { select: '*', order: 'mulai_sewa.desc,id.asc' });
+  if (resource === 'dashboard' && method === 'GET') return getDashboard(requestUrl.searchParams);
+  if (resource === 'report' && method === 'GET') return reportRowsForPeriod(await report(), requestUrl.searchParams);
+  if ((resource === 'rentals' || resource === 'payments') && method === 'GET') return report();
+  if (resource === 'customers' && method === 'GET') return supabaseRows('pelanggan', { select: '*', order: 'nama.asc,id.asc' });
+  if (resource === 'units' && method === 'GET') return getUnits();
+  if (resource === 'rooms' && method === 'GET') return supabaseRows('ruangan', { select: '*', order: 'kode_ruangan.asc' });
+  if (resource === 'tariffs' && method === 'GET') return supabaseRows('tarif_konsol', { select: '*', order: 'tipe_konsol.asc' });
+  if (resource === 'customers' && method === 'POST') return saveCustomer(payload);
+  if (resource === 'customers' && method === 'PATCH' && id) return (await supabaseRequest('pelanggan', { method, query: { id: `eq.${id}` }, body: payload }))[0];
+  if (resource === 'customers' && method === 'DELETE' && id) return supabaseRequest('pelanggan', { method, query: { id: `eq.${id}` } });
+  if (resource === 'units' && method === 'POST') return saveUnit(payload);
+  if (resource === 'units' && (method === 'PATCH' || method === 'DELETE') && id) {
+    const { tarif_per_jam, ...unitPayload } = payload;
+    if (method === 'PATCH' && Number(tarif_per_jam) > 0) {
+      const unit = (await supabaseRequest('unit_playstation', { query: { select: 'tipe_konsol', id: `eq.${id}` } }))[0];
+      if (!unit) throw new Error('Unit PlayStation tidak ditemukan.');
+      await supabaseRequest('tarif_konsol', { method: 'PATCH', query: { tipe_konsol: `eq.${unit.tipe_konsol}` }, body: { tarif_per_jam: Number(tarif_per_jam) } });
     }
-
-    const result = await supabaseRequest(
-      'pelanggan',
-      {
-        method: 'POST',
-        body: {
-          nama: body.nama.trim(),
-          nomor_telepon:
-            body.nomor_telepon?.trim() || null,
-          email: body.email?.trim() || null,
-          aktif: true
-        }
-      }
-    );
-
-    return result[0];
+    return method === 'PATCH'
+      ? (await supabaseRequest('unit_playstation', { method, query: { id: `eq.${id}` }, body: unitPayload }))[0]
+      : supabaseRequest('unit_playstation', { method, query: { id: `eq.${id}` } });
   }
-
-  const customerMatch = endpoint.match(
-    /^\/api\/customers\/([^/]+)$/
-  );
-
-  if (customerMatch && method === 'PATCH') {
-    const id = customerMatch[1];
-
-    if (
-      body.nama !== undefined &&
-      body.nama.trim().length < 2
-    ) {
-      throw new Error(
-        'Nama pelanggan minimal 2 karakter.'
-      );
-    }
-
-    const result = await supabaseRequest(
-      'pelanggan',
-      {
-        method: 'PATCH',
-        query: {
-          id: `eq.${id}`
-        },
-        body
-      }
-    );
-
-    return result[0];
-  }
-
-  if (customerMatch && method === 'DELETE') {
-    const id = customerMatch[1];
-
-    await supabaseRequest(
-      'pelanggan',
-      {
-        method: 'DELETE',
-        query: {
-          id: `eq.${id}`
-        }
-      }
-    );
-
-    return null;
-  }
-
-  if (endpoint === '/api/units' && method === 'POST') {
-    const consoleType = body.tipe_konsol || 'PS4';
-    if (!body.kode_unit || !body.nama_unit || !['PS4', 'PS5'].includes(consoleType)) {
-      throw new Error(
-        'Kode, nama, dan tipe konsol unit wajib valid.'
-      );
-    }
-
-    const result = await supabaseRequest(
-      'unit_playstation',
-      {
-        method: 'POST',
-        body: {
-          kode_unit: body.kode_unit.trim(),
-          nama_unit: body.nama_unit.trim(),
-          tipe_konsol: consoleType,
-          status: body.status || 'Tersedia',
-          catatan: body.catatan || null
-        }
-      }
-    );
-
-    return result[0];
-  }
-
-  const tariffMatch = endpoint.match(/^\/api\/tariffs\/(PS4|PS5)$/);
-
-  if (tariffMatch && method === 'PATCH') {
-    const amount = Number(body.tarif_per_jam);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new Error('Tarif per jam harus lebih dari nol.');
-    }
-    const result = await supabaseRequest('tarif_konsol', {
-      method: 'PATCH',
-      query: { tipe_konsol: `eq.${tariffMatch[1]}` },
-      body: { tarif_per_jam: amount }
-    });
-    return result[0];
-  }
-
-  const unitMatch = endpoint.match(
-    /^\/api\/units\/([^/]+)$/
-  );
-
-  if (unitMatch && method === 'PATCH') {
-    const id = unitMatch[1];
-
-    const result = await supabaseRequest(
-      'unit_playstation',
-      {
-        method: 'PATCH',
-        query: {
-          id: `eq.${id}`
-        },
-        body
-      }
-    );
-
-    return result[0];
-  }
-
-  if (unitMatch && method === 'DELETE') {
-    const id = unitMatch[1];
-
-    await supabaseRequest(
-      'unit_playstation',
-      {
-        method: 'DELETE',
-        query: {
-          id: `eq.${id}`
-        }
-      }
-    );
-
-    return null;
-  }
-
-  if (endpoint === '/api/rentals' && method === 'POST') {
-    if (body.pelanggan_id === '__new__') {
-      if (
-        !body.customer_name ||
-        body.customer_name.trim().length < 2
-      ) {
-        throw new Error(
-          'Nama pelanggan baru minimal 2 karakter.'
-        );
-      }
-
-      const createdCustomer =
-        await supabaseRequest(
-          'pelanggan',
-          {
-            method: 'POST',
-            body: {
-              nama: body.customer_name.trim(),
-              nomor_telepon:
-                body.customer_phone?.trim() || null,
-              email:
-                body.customer_email?.trim() || null,
-              aktif: true
-            }
-          }
-        );
-
-      body.pelanggan_id =
-        createdCustomer[0].id;
-    }
-
-    const duration = Number(body.durasi_jam);
-
-    if (
-      !body.pelanggan_id ||
-      !body.unit_id ||
-      !Number.isFinite(duration) ||
-      duration <= 0
-    ) {
-      throw new Error(
-        'Pelanggan, unit, dan durasi lebih dari nol wajib diisi.'
-      );
-    }
-
-    const customerRows = await supabaseRequest(
-      'pelanggan',
-      {
-        query: {
-          select: 'id',
-          id: `eq.${body.pelanggan_id}`,
-          aktif: 'eq.true'
-        }
-      }
-    );
-
-    if (!customerRows[0]) {
-      throw new Error(
-        'Pelanggan aktif tidak ditemukan.'
-      );
-    }
-
-    const unitRows = await supabaseRequest(
-      'unit_playstation',
-      {
-        query: {
-          select: '*',
-          id: `eq.${body.unit_id}`
-        }
-      }
-    );
-
-    const unit = unitRows[0];
-
-    if (!unit) {
-      throw new Error(
-        'Unit PlayStation tidak ditemukan.'
-      );
-    }
-
-    if (unit.status !== 'Tersedia') {
-      throw new Error(
-        `Unit sedang ${unit.status.toLowerCase()} dan tidak dapat disewa.`
-      );
-    }
-
-    const roomId = body.ruangan_id || null;
-    let room = null;
-    let roomRate = 0;
-    if (roomId) {
-      const roomRows = await supabaseRequest('ruangan', {
-        query: { select: '*', id: `eq.${roomId}` }
-      });
-      room = roomRows[0];
-      if (!room) throw new Error('Ruangan tidak ditemukan.');
-      if (room.status !== 'Tersedia') throw new Error('Ruangan tidak tersedia.');
-      const roomTariffs = await supabaseRequest('tarif_ruangan', {
-        query: {
-          select: 'tarif_per_jam',
-          tipe_ruangan: `eq.${room.tipe_ruangan}`
-        }
-      });
-      roomRate = Number(roomTariffs[0]?.tarif_per_jam);
-      if (!Number.isFinite(roomRate) || roomRate <= 0) {
-        throw new Error(`Tarif ruang ${room.tipe_ruangan} tidak ditemukan.`);
-      }
-    }
-
-    const tariffRows = await supabaseRequest('tarif_konsol', {
-      query: {
-        select: 'tarif_per_jam',
-        tipe_konsol: `eq.${unit.tipe_konsol}`
-      }
-    });
-    const hourlyRate = Number(tariffRows[0]?.tarif_per_jam);
-    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
-      throw new Error(`Tarif ${unit.tipe_konsol} tidak ditemukan.`);
-    }
-    const total = Number(((hourlyRate + roomRate) * duration).toFixed(2));
-
-    const rentalResult = await supabaseRequest(
-      'penyewaan',
-      {
-        method: 'POST',
-        body: {
-          kode_penyewaan:
-            body.kode_penyewaan ||
-            `SEWA-${Date.now()
-              .toString()
-              .slice(-8)}`,
-
-          pelanggan_id: body.pelanggan_id,
-
-          unit_id: body.unit_id,
-
-          ruangan_id: roomId,
-
-          mulai_sewa:
-            body.mulai_sewa ||
-            new Date().toISOString(),
-
-          durasi_jam: duration,
-
-          tarif_per_jam: hourlyRate,
-
-          tarif_ruangan_per_jam: roomRate,
-
-          total_biaya: total,
-
-          status:
-            body.status || 'Berlangsung',
-
-          catatan:
-            body.catatan || null
-        }
-      }
-    );
-
-    const rental = rentalResult[0];
-
-    if (body.status === 'Berlangsung' || !body.status) {
-      await supabaseRequest(
-        'unit_playstation',
-        {
-          method: 'PATCH',
-          query: {
-            id: `eq.${unit.id}`
-          },
-          body: {
-            status: 'Disewa'
-          }
-        }
-      );
-      if (room) {
-        await supabaseRequest('ruangan', {
-          method: 'PATCH',
-          query: { id: `eq.${room.id}` },
-          body: { status: 'Disewa' }
-        });
-      }
-    }
-
-    if (Number(body.jumlah_bayar) > 0) {
-      await savePaymentDirect(
-        rental.id,
-        Number(body.jumlah_bayar),
-        body.metode_pembayaran || 'Tunai'
-      );
-    }
-
-    return rental;
-  }
-
-  const rentalMatch = endpoint.match(
-    /^\/api\/rentals\/([^/]+)$/
-  );
-
-  if (rentalMatch && method === 'PATCH') {
-    const id = rentalMatch[1];
-
-    const updateData = { ...body };
-    const currentRows = await supabaseRequest('penyewaan', {
-      query: {
-        select: 'unit_id,ruangan_id,status,tarif_per_jam,tarif_ruangan_per_jam',
-        id: `eq.${id}`
-      }
-    });
-    const rental = currentRows[0];
-    if (!rental) throw new Error('Transaksi penyewaan tidak ditemukan.');
-
-    if (body.durasi_jam !== undefined) {
-      const duration = Number(body.durasi_jam);
-
-      if (!Number.isFinite(duration) || duration <= 0) {
-        throw new Error(
-          'Durasi harus lebih dari nol.'
-        );
-      }
-
-      updateData.durasi_jam = duration;
-      updateData.total_biaya = Number(
-        (duration * (Number(rental.tarif_per_jam) + Number(rental.tarif_ruangan_per_jam || 0))).toFixed(2)
-      );
-    }
-
-    if (rental.status !== 'Berlangsung' && body.status === 'Berlangsung') {
-      const units = await supabaseRequest('unit_playstation', {
-        query: { select: 'id,status', id: `eq.${rental.unit_id}` }
-      });
-      if (units[0]?.status !== 'Tersedia') throw new Error('Unit tidak tersedia untuk mengaktifkan kembali transaksi.');
-      if (rental.ruangan_id) {
-        const rooms = await supabaseRequest('ruangan', {
-          query: { select: 'id,status', id: `eq.${rental.ruangan_id}` }
-        });
-        if (rooms[0]?.status !== 'Tersedia') throw new Error('Ruangan tidak tersedia untuk mengaktifkan kembali transaksi.');
-      }
-    }
-
-    const result = await supabaseRequest(
-      'penyewaan',
-      {
-        method: 'PATCH',
-        query: {
-          id: `eq.${id}`
-        },
-        body: updateData
-      }
-    );
-
-    if (body.status === 'Berlangsung' && rental.status !== 'Berlangsung') {
-      await supabaseRequest('unit_playstation', {
-        method: 'PATCH',
-        query: { id: `eq.${rental.unit_id}` },
-        body: { status: 'Disewa' }
-      });
-      if (rental.ruangan_id) {
-        await supabaseRequest('ruangan', {
-          method: 'PATCH',
-          query: { id: `eq.${rental.ruangan_id}` },
-          body: { status: 'Disewa' }
-        });
-      }
-    } else if (rental.status === 'Berlangsung' && body.status && body.status !== 'Berlangsung') {
-      await supabaseRequest('unit_playstation', {
-        method: 'PATCH',
-        query: { id: `eq.${rental.unit_id}` },
-        body: { status: 'Tersedia' }
-      });
-      if (rental.ruangan_id) {
-        await supabaseRequest('ruangan', {
-          method: 'PATCH',
-          query: { id: `eq.${rental.ruangan_id}` },
-          body: { status: 'Tersedia' }
-        });
-      }
-    }
-
-    return result[0];
-  }
-
-  if (rentalMatch && method === 'DELETE') {
-    const id = rentalMatch[1];
-
-    const rentalRows = await supabaseRequest('penyewaan', {
-      query: { select: 'unit_id,ruangan_id,status', id: `eq.${id}` }
-    });
-    const rental = rentalRows[0];
-
-    await supabaseRequest(
-      'penyewaan',
-      {
-        method: 'DELETE',
-        query: {
-          id: `eq.${id}`
-        }
-      }
-    );
-
+  if (resource === 'rentals' && method === 'POST') return saveRental(payload);
+  if (resource === 'rentals' && method === 'PATCH' && id) return updateRental(id, payload);
+  if (resource === 'rentals' && method === 'DELETE' && id) {
+    const rental = (await supabaseRequest('penyewaan', { query: { select: 'unit_id,ruangan_id,status', id: `eq.${id}` } }))[0];
+    const result = await supabaseRequest('penyewaan', { method, query: { id: `eq.${id}` } });
     if (rental?.status === 'Berlangsung') {
-      await supabaseRequest('unit_playstation', {
-        method: 'PATCH',
-        query: { id: `eq.${rental.unit_id}` },
-        body: { status: 'Tersedia' }
-      });
-      if (rental.ruangan_id) {
-        await supabaseRequest('ruangan', {
-          method: 'PATCH',
-          query: { id: `eq.${rental.ruangan_id}` },
-          body: { status: 'Tersedia' }
-        });
-      }
+      await supabaseRequest('unit_playstation', { method: 'PATCH', query: { id: `eq.${rental.unit_id}` }, body: { status: 'Tersedia' } });
+      if (rental.ruangan_id) await supabaseRequest('ruangan', { method: 'PATCH', query: { id: `eq.${rental.ruangan_id}` }, body: { status: 'Tersedia' } });
     }
-
-    return null;
+    return result;
   }
-
-  if (endpoint === '/api/payments' && method === 'POST') {
-    if (
-      !body.penyewaan_id ||
-      !Number.isFinite(Number(body.jumlah_bayar)) ||
-      Number(body.jumlah_bayar) <= 0
-    ) {
-      throw new Error(
-        'Transaksi dan jumlah pembayaran wajib valid.'
-      );
-    }
-
-    return savePaymentDirect(
-      body.penyewaan_id,
-      Number(body.jumlah_bayar),
-      body.metode_pembayaran || 'Tunai',
-      body.catatan
-    );
-  }
-
-  throw new Error(
-    'Endpoint tidak ditemukan.'
-  );
+  if (resource === 'payments' && method === 'POST') return savePayment(payload);
+  throw new Error(`Operasi ${method} untuk data ${resource} tidak didukung.`);
 }
 
 function setText(selector, value) { const element = $(selector); if (element) element.textContent = value; }
@@ -926,24 +281,8 @@ function getCustomQuery() {
 function modalControl(id, open) { const dialog = $(`#${id}`); if (!dialog) return; open ? dialog.showModal() : dialog.close(); }
 
 function navMarkup(active) {
-  const links = [
-    ['dashboard', 'index.html', 'layout-dashboard', 'Dashboard'],
-    ['rentals', 'transaksi.html', 'receipt-text', 'Transaksi'],
-    ['units', 'unit.html', 'gamepad-2', 'Unit PlayStation'],
-    ['customers', 'pelanggan.html', 'users-round', 'Pelanggan'],
-    ['payments', 'pembayaran.html', 'credit-card', 'Pembayaran'],
-    ['reports', 'laporan.html', 'chart-no-axes-column-increasing', 'Laporan']
-  ];
-
-  return `<aside class="sidebar">
-    <a class="brand" href="index.html" aria-label="PlayVora, Dashboard">
-      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 48 48" focusable="false"><defs><linearGradient id="pv-mark-gradient" x1="7" y1="8" x2="41" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#22D3EE"/><stop offset=".55" stop-color="#A855F7"/><stop offset="1" stop-color="#EC4899"/></linearGradient></defs><path d="M11 8.5h17.5L39 17v14l-10.5 8.5H11L7 33V15z" fill="none" stroke="url(#pv-mark-gradient)" stroke-linejoin="round" stroke-width="1.8"/><path d="M15 32V16h8a5 5 0 0 1 0 10h-8m12-8 5.5 14 5.5-14" fill="none" stroke="url(#pv-mark-gradient)" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.8"/></svg></span>
-      <span class="brand-copy"><strong>PlayVora</strong><small>Sistem Akuntansi Rental PlayStation</small></span>
-    </a>
-    <nav class="side-nav" aria-label="Navigasi utama">
-      ${links.map(([page, href, icon, label]) => `<a class="${active === page ? 'active' : ''}" href="${href}"${active === page ? ' aria-current="page"' : ''}><i class="nav-icon" data-lucide="${icon}" aria-hidden="true"></i><span>${label}</span></a>`).join('')}
-    </nav>
-  </aside>`;
+  const links = [['dashboard', 'index.html', 'Dashboard', 'layout-dashboard'], ['rentals', 'transaksi.html', 'Transaksi', 'receipt-text'], ['units', 'unit.html', 'Unit PS', 'gamepad-2'], ['customers', 'pelanggan.html', 'Pelanggan', 'users-round'], ['payments', 'pembayaran.html', 'Pembayaran', 'wallet-cards'], ['reports', 'laporan.html', 'Laporan', 'file-chart-column']];
+  return `<aside class="sidebar"><div class="brand"><span class="brand-mark"><i data-lucide="gamepad-2" aria-hidden="true"></i></span><span>PlayVora</span></div><nav class="side-nav" aria-label="Navigasi utama">${links.map(([key, href, label, icon]) => `<a class="${key === active ? 'active' : ''}" href="${href}" aria-label="${label}" title="${label}"><i class="nav-icon" data-lucide="${icon}" aria-hidden="true"></i><span>${label}</span></a>`).join('')}</nav><div class="sidebar-footer">Sistem akuntansi rental PlayStation</div></aside>`;
 }
 function loadLucideIcons() {
   if (window.lucide) { window.lucide.createIcons(); return; }
@@ -970,7 +309,6 @@ async function renderDashboard(data) {
   setText('#unit-available', data.unitSummary.available);
   setText('#unit-rented', data.unitSummary.rented);
   setText('#unit-maintenance', data.unitSummary.maintenance);
-  setText('#unit-total', data.unitSummary.total);
   renderActiveSessions(data.activeSessions || []);
   renderRecentTransactions(data.recentTransactions || []);
   ensureRevenueChartControls();
@@ -982,7 +320,7 @@ async function renderDashboard(data) {
 function renderActiveSessions(rows) {
   const target = $('#active-sessions');
   if (!target) return;
-  target.innerHTML = rows.length ? rows.map((row) => `<div class="session-row"><div><b>${escapeHtml(row.nama_pelanggan)}</b><small>${escapeHtml(row.nama_unit)}${row.nama_ruangan ? ` · ${escapeHtml(row.nama_ruangan)}` : ''} · mulai ${formatDate(row.mulai_sewa)}</small></div><strong>${row.durasi_jam} jam</strong>${statusBadge(row.status)}</div>`).join('') : '<div class="empty">Tidak ada sesi yang sedang berlangsung.</div>';
+  target.innerHTML = rows.length ? rows.map((row) => `<div class="session-row"><div><b>${escapeHtml(row.nama_pelanggan)}</b><small>${escapeHtml(row.nama_unit)} · mulai ${formatDate(row.mulai_sewa)}</small></div><strong>${row.durasi_jam} jam</strong>${statusBadge(row.status)}</div>`).join('') : '<div class="empty">Tidak ada sesi yang sedang berlangsung.</div>';
 }
 function renderRecentTransactions(rows) {
   const target = $('#recent-transactions');
@@ -1015,12 +353,25 @@ function localDateKey(value) {
   return `${year}-${month}-${day}`;
 }
 function dateKeyToDate(key) { const [year, month, day] = key.split('-').map(Number); return new Date(year, month - 1, day); }
-function chartPeriodRange() {
-  const end = new Date(); end.setHours(0, 0, 0, 0);
+function chartPeriodRange(rows) {
+  if (['today', 'week', 'month', 'custom'].includes(state.chartPeriod)) {
+    const params = new URLSearchParams({ period: state.chartPeriod });
+    if (state.chartPeriod === 'custom') {
+      params.set('start', $('#custom-start')?.value || '');
+      params.set('end', $('#custom-end')?.value || '');
+    }
+    return periodBounds(params);
+  }
+  const end = new Date(); end.setHours(23, 59, 59, 999);
   const start = new Date(end);
-  if (state.chartPeriod === 'all') { start.setTime(0); return { start, end }; }
-  if (state.chartPeriod === 'month') start.setDate(1);
-  else start.setDate(start.getDate() - Number(state.chartPeriod) + 1);
+  if (state.chartPeriod === 'all') {
+    const paidDates = rows.map((row) => row.tanggal_bayar).filter(Boolean).map((value) => new Date(value)).filter((date) => !Number.isNaN(date.getTime()));
+    start.setTime(paidDates.length ? Math.min(...paidDates) : end.getTime());
+    start.setHours(0, 0, 0, 0);
+    return { start, end };
+  }
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - Number(state.chartPeriod) + 1);
   return { start, end };
 }
 function chartDateKeys(start, end) {
@@ -1033,7 +384,7 @@ function renderRevenueEmpty(message = 'Belum ada data pendapatan pada periode in
   if (!target) return;
   state.revenueChart?.destroy(); state.revenueChart = null;
   target.classList.add('chart-empty-state');
-  target.innerHTML = `<div class="chart-empty"><i data-lucide="chart-no-axes-column-increasing"></i><b>${message}</b><small>Data akan muncul setelah transaksi tersedia.</small></div>`;
+  target.innerHTML = `<div class="chart-empty"><i data-lucide="chart-no-axes-column-increasing"></i><b>${escapeHtml(message)}</b><small>Data akan muncul setelah transaksi tersedia.</small></div>`;
   refreshIcons();
 }
 function ensureRevenueChartControls() {
@@ -1056,15 +407,15 @@ async function loadRevenueChart() {
   try {
     const Chart = await loadChartJs();
     const rentals = await api('/api/rentals');
-    const { start, end } = chartPeriodRange();
-    const grouped = rentals.filter((row) => new Date(row.mulai_sewa) >= start && new Date(row.mulai_sewa) <= new Date(end.getTime() + 86400000 - 1)).reduce((result, row) => {
-      const date = localDateKey(row.mulai_sewa);
-      result[date] = (result[date] || 0) + Number(row.total_biaya || 0);
+    const { start, end } = chartPeriodRange(rentals);
+    const grouped = rentals.filter((row) => row.tanggal_bayar && Number(row.jumlah_bayar) > 0 && inPeriod(row.tanggal_bayar, { start, end })).reduce((result, row) => {
+      const date = localDateKey(row.tanggal_bayar);
+      result[date] = (result[date] || 0) + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0));
       return result;
     }, {});
     const keys = chartDateKeys(start, end);
     const values = keys.map((key) => grouped[key] || 0);
-    if (!rentals.some((row) => isFinite(Number(row.total_biaya)) && Number(row.total_biaya) > 0 && new Date(row.mulai_sewa) >= start && new Date(row.mulai_sewa) <= end)) { renderRevenueEmpty(); return; }
+    if (!Object.keys(grouped).length) { renderRevenueEmpty(); return; }
     target.classList.remove('chart-empty-state');
     target.innerHTML = '<canvas id="revenue-chart-canvas" aria-label="Grafik perkembangan pendapatan"></canvas>';
     state.revenueChart?.destroy();
@@ -1094,8 +445,8 @@ async function loadDashboard() {
   const query = `?period=${state.period}${state.period === 'custom' ? getCustomQuery() : ''}`;
   try { await renderDashboard(await api(`/api/dashboard${query}`)); } catch (error) { showToast(error.message, 'error'); }
 }
-function ensureDashboardPeriodControls() {
-  if (pageName !== 'dashboard') return;
+function ensurePeriodControls() {
+  if (!['dashboard', 'reports'].includes(pageName)) return;
   const toolbar = document.querySelector('.period-buttons');
   if (!toolbar || toolbar.querySelector('[data-period="all"]')) return;
   toolbar.insertAdjacentHTML('beforeend', '<button data-period="all">All</button>');
@@ -1106,8 +457,8 @@ function renderRentals(rows = state.rentals) {
   if (!target) return;
   const query = ($('#rental-search')?.value || '').toLowerCase();
   const status = $('#rental-status')?.value || '';
-  const filtered = rows.filter((row) => (!status || row.status === status) && [row.kode_penyewaan, row.nama_pelanggan, row.kode_unit, row.nama_ruangan].some((value) => String(value || '').toLowerCase().includes(query)));
-  target.innerHTML = filtered.length ? filtered.map((row) => `<tr><td>${escapeHtml(row.kode_penyewaan)}</td><td>${escapeHtml(row.nama_pelanggan)}</td><td>${escapeHtml(row.kode_unit)} · ${escapeHtml(row.nama_unit)}</td><td>${escapeHtml(row.nama_ruangan || '-')}</td><td>${row.durasi_jam} jam</td><td>${formatRupiah(row.total_biaya)}</td><td>${formatRupiah(row.jumlah_bayar)}</td><td>${formatRupiah(row.piutang)}</td><td>${statusBadge(row.status_pembayaran)}</td><td>${statusBadge(row.status)}</td><td class="action-cell"><button class="icon-btn detail-rental" data-id="${row.id}">Lihat</button><button class="icon-btn edit-rental" data-id="${row.id}">Edit</button><button class="icon-btn danger delete-rental" data-id="${row.id}">Hapus</button></td></tr>`).join('') : '<tr><td colspan="11" class="empty">Tidak ada transaksi yang cocok.</td></tr>';
+  const filtered = rows.filter((row) => (!status || row.status === status) && [row.kode_penyewaan, row.nama_pelanggan, row.kode_unit].some((value) => String(value || '').toLowerCase().includes(query)));
+  target.innerHTML = filtered.length ? filtered.map((row) => `<tr><td>${escapeHtml(row.kode_penyewaan)}</td><td>${escapeHtml(row.nama_pelanggan)}</td><td>${escapeHtml(row.kode_unit)} · ${escapeHtml(row.nama_unit)}</td><td>${escapeHtml(row.kode_ruangan || '-')}</td><td>${row.durasi_jam} jam</td><td>${formatRupiah(row.total_biaya)}</td><td>${formatRupiah(row.jumlah_bayar)}</td><td>${formatRupiah(row.piutang)}</td><td>${statusBadge(row.status_pembayaran)}</td><td>${statusBadge(row.status)}</td><td class="action-cell"><button class="icon-btn detail-rental" data-id="${row.id}">Lihat</button><button class="icon-btn edit-rental" data-id="${row.id}">Edit</button><button class="icon-btn danger delete-rental" data-id="${row.id}">Hapus</button></td></tr>`).join('') : '<tr><td colspan="11" class="empty">Tidak ada transaksi yang cocok.</td></tr>';
   setText('#rental-count-page', filtered.length);
   setText('#transaction-running', rows.filter((row) => row.status === 'Berlangsung').length);
   setText('#transaction-value', formatRupiah(rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0)));
@@ -1127,56 +478,34 @@ function ensureInlineCustomerFields() {
   if (!select.querySelector('option[value="__new__"]')) select.insertAdjacentHTML('afterbegin', '<option value="__new__">+ Pelanggan baru</option>');
   select.value = state.customers.length ? state.customers[0].id : '__new__';
 }
-async function loadRooms() { try { state.rooms = await api('/api/rooms'); } catch (error) { state.rooms = []; showToast(error.message, 'error'); } }
-function updateRentalEstimate() {
-  const unit = state.units.find((row) => row.id === $('#rental-unit')?.value);
-  const room = state.rooms.find((row) => row.id === $('#rental-room')?.value);
-  const duration = Number($('#rental-form [name="durasi_jam"]')?.value);
-  const target = $('#rental-estimate');
-  if (!target) return;
-  target.textContent = unit && Number.isFinite(duration) && duration > 0
-    ? formatRupiah((Number(unit.tarif_per_jam) + Number(room?.tarif_per_jam || 0)) * duration)
-    : 'Pilih unit dan durasi';
-}
 async function openRentalModal() {
-  await Promise.all([loadCustomers(), loadUnits(), loadRooms()]);
-  fillSelect('#rental-customer', state.customers.filter((row) => row.aktif), 'id', (row) => row.nama);
-  fillSelect('#rental-unit', state.units.filter((row) => row.status === 'Tersedia'), 'id', (row) => `${row.nama_unit} · ${row.tipe_konsol} · ${formatRupiah(row.tarif_per_jam)}/jam`);
-  const roomSelect = $('#rental-room');
-  if (roomSelect) roomSelect.innerHTML = `<option value="">Tanpa ruangan tambahan</option>${state.rooms.filter((row) => row.status === 'Tersedia').map((row) => `<option value="${row.id}">${escapeHtml(row.nama_ruangan)} · ${escapeHtml(row.tipe_ruangan)} · ${formatRupiah(row.tarif_per_jam)}/jam</option>`).join('')}`;
-  ensureInlineCustomerFields();
-  updateRentalEstimate();
-  modalControl('rental-modal', true);
+  try {
+    const [, , rooms] = await Promise.all([loadCustomers(), loadUnits(), api('/api/rooms')]);
+    fillSelect('#rental-customer', state.customers.filter((row) => row.aktif), 'id', (row) => row.nama);
+    fillSelect('#rental-unit', state.units.filter((row) => row.status === 'Tersedia'), 'id', (row) => `${row.kode_unit} · ${row.nama_unit}`);
+    const roomSelect = $('#rental-room');
+    if (roomSelect) roomSelect.innerHTML = '<option value="">Tanpa ruangan tambahan</option>' + rooms.filter((row) => row.status === 'Tersedia').map((row) => `<option value="${row.id}">${escapeHtml(row.kode_ruangan)} · ${escapeHtml(row.nama_ruangan)} (${escapeHtml(row.tipe_ruangan)})</option>`).join('');
+    ensureInlineCustomerFields();
+    modalControl('rental-modal', true);
+  } catch (error) { showToast(error.message, 'error'); }
 }
 async function saveRental(event) {
   event.preventDefault();
-  const formElement = event.currentTarget;
-  const form = new FormData(formElement);
+  const form = new FormData(event.currentTarget);
   const payload = Object.fromEntries(form.entries());
-  try { await api('/api/rentals', { method: 'POST', body: JSON.stringify(payload) }); modalControl('rental-modal', false); formElement.reset(); showToast('Transaksi berhasil disimpan.'); await Promise.all([loadRentals(), loadUnits(), loadRooms()]); updateRentalEstimate(); } catch (error) { showToast(error.message, 'error'); }
+  try { await api('/api/rentals', { method: 'POST', body: JSON.stringify(payload) }); modalControl('rental-modal', false); event.currentTarget.reset(); showToast('Transaksi berhasil disimpan.'); await loadRentals(); } catch (error) { showToast(error.message, 'error'); }
 }
 function showRentalDetail(id) {
   const row = state.rentals.find((item) => item.id === id); if (!row) return;
-  $('#detail-content').innerHTML = `<div class="receipt-header"><div class="receipt-icon"><i data-lucide="receipt-text" aria-hidden="true"></i></div><div><p class="eyebrow">Detail transaksi</p><h2>Detail Transaksi</h2><span>${escapeHtml(row.kode_penyewaan)}</span></div><div class="receipt-status">${statusBadge(row.status)}</div></div><div class="receipt-total"><span>Total biaya</span><strong>${formatRupiah(row.total_biaya)}</strong><small>${row.durasi_jam} jam × (${formatRupiah(row.tarif_per_jam)} PS${row.nama_ruangan ? ` + ${formatRupiah(row.tarif_ruangan_per_jam)} ruang` : ''})/jam</small></div><div class="receipt-sections"><section><div class="receipt-section-title"><i data-lucide="gamepad-2" aria-hidden="true"></i><h3>Informasi penyewaan</h3></div><div class="receipt-grid"><span>ID transaksi</span><b>${escapeHtml(row.kode_penyewaan)}</b><span>Pelanggan</span><b>${escapeHtml(row.nama_pelanggan)}</b><span>Unit PlayStation</span><b>${escapeHtml(row.kode_unit)} · ${escapeHtml(row.nama_unit)}</b><span>Ruangan</span><b>${escapeHtml(row.nama_ruangan || 'Tanpa ruangan')}</b><span>Waktu mulai</span><b>${formatDate(row.mulai_sewa)}</b><span>Durasi</span><b>${row.durasi_jam} jam</b></div></section><section><div class="receipt-section-title"><i data-lucide="calculator" aria-hidden="true"></i><h3>Rincian biaya</h3></div><div class="receipt-grid"><span>Tarif PS per jam</span><b>${formatRupiah(row.tarif_per_jam)}</b><span>Tarif ruang per jam</span><b>${row.nama_ruangan ? formatRupiah(row.tarif_ruangan_per_jam) : '-'}</b><span>Total biaya</span><b class="accent-value">${formatRupiah(row.total_biaya)}</b><span>Jumlah pembayaran</span><b class="paid-value">${formatRupiah(row.jumlah_bayar)}</b><span>Piutang</span><b class="debt-value">${formatRupiah(row.piutang)}</b></div></section><section><div class="receipt-section-title"><i data-lucide="credit-card" aria-hidden="true"></i><h3>Pembayaran</h3></div><div class="receipt-grid"><span>Metode pembayaran</span><b>${escapeHtml(row.metode_pembayaran || '-')}</b><span>Status pembayaran</span><b>${statusBadge(row.status_pembayaran)}</b><span>Tanggal pembayaran</span><b>${formatDate(row.tanggal_bayar)}</b></div></section></div>`;
+  $('#detail-content').innerHTML = `<div class="receipt-header"><div class="receipt-icon"><i data-lucide="receipt-text" aria-hidden="true"></i></div><div><p class="eyebrow">Detail transaksi</p><h2>Detail Transaksi</h2><span>${escapeHtml(row.kode_penyewaan)}</span></div><div class="receipt-status">${statusBadge(row.status)}</div></div><div class="receipt-total"><span>Total biaya</span><strong>${formatRupiah(row.total_biaya)}</strong><small>${row.durasi_jam} jam × ${formatRupiah(row.tarif_per_jam)}/jam</small></div><div class="receipt-sections"><section><div class="receipt-section-title"><i data-lucide="gamepad-2" aria-hidden="true"></i><h3>Informasi penyewaan</h3></div><div class="receipt-grid"><span>ID transaksi</span><b>${escapeHtml(row.kode_penyewaan)}</b><span>Pelanggan</span><b>${escapeHtml(row.nama_pelanggan)}</b><span>Unit PlayStation</span><b>${escapeHtml(row.kode_unit)} · ${escapeHtml(row.nama_unit)}</b><span>Waktu mulai</span><b>${formatDate(row.mulai_sewa)}</b><span>Durasi</span><b>${row.durasi_jam} jam</b></div></section><section><div class="receipt-section-title"><i data-lucide="calculator" aria-hidden="true"></i><h3>Rincian biaya</h3></div><div class="receipt-grid"><span>Tarif per jam</span><b>${formatRupiah(row.tarif_per_jam)}</b><span>Total biaya</span><b class="accent-value">${formatRupiah(row.total_biaya)}</b><span>Jumlah pembayaran</span><b class="paid-value">${formatRupiah(row.jumlah_bayar)}</b><span>Piutang</span><b class="debt-value">${formatRupiah(row.piutang)}</b></div></section><section><div class="receipt-section-title"><i data-lucide="credit-card" aria-hidden="true"></i><h3>Pembayaran</h3></div><div class="receipt-grid"><span>Metode pembayaran</span><b>${escapeHtml(row.metode_pembayaran || '-')}</b><span>Status pembayaran</span><b>${statusBadge(row.status_pembayaran)}</b><span>Tanggal pembayaran</span><b>${formatDate(row.tanggal_bayar)}</b></div></section></div>`;
   refreshIcons(); modalControl('detail-modal', true);
 }
 
-function prepareUnitForm() {
-  const rateInput = $('#unit-form [name="tarif_per_jam"]');
-  if (!rateInput) return;
-  const fields = rateInput.closest('.grid-2');
-  rateInput.closest('label')?.remove();
-  fields?.classList.remove('grid-2');
-  const priceLabel = $('#price-list')?.closest('.price-list-card')?.querySelector('.live-label');
-  if (priceLabel) priceLabel.textContent = 'Tarif berlaku per tipe konsol';
-}
 function renderUnits(rows = state.units) {
   const target = $('#unit-list'); if (!target) return;
-  const rateHeader = target.closest('table')?.querySelector('thead th:nth-child(4)');
-  if (rateHeader?.textContent.trim() === 'Tarif/jam') rateHeader.remove();
   const query = ($('#unit-search')?.value || '').toLowerCase(); const status = $('#unit-status-filter')?.value || '';
   const filtered = rows.filter((row) => (!status || row.status === status) && [row.kode_unit, row.nama_unit, row.tipe_konsol].some((value) => String(value || '').toLowerCase().includes(query)));
-  target.innerHTML = filtered.length ? filtered.map((row) => `<tr><td>${escapeHtml(row.kode_unit)}</td><td>${escapeHtml(row.nama_unit)}</td><td>${escapeHtml(row.tipe_konsol)}</td><td>${statusBadge(row.status)}</td><td>${escapeHtml(row.catatan || '-')}</td><td class="action-cell"><button class="icon-btn edit-unit" data-id="${row.id}">Edit</button><button class="icon-btn danger delete-unit" data-id="${row.id}">Hapus</button></td></tr>`).join('') : '<tr><td colspan="6" class="empty">Belum ada unit yang cocok.</td></tr>';
+  target.innerHTML = filtered.length ? filtered.map((row) => `<tr><td>${escapeHtml(row.kode_unit)}</td><td>${escapeHtml(row.nama_unit)}</td><td>${escapeHtml(row.tipe_konsol)}</td><td>${formatRupiah(row.tarif_per_jam)}</td><td>${statusBadge(row.status)}</td><td>${escapeHtml(row.catatan || '-')}</td><td class="action-cell"><button class="icon-btn edit-unit" data-id="${row.id}">Edit</button><button class="icon-btn danger delete-unit" data-id="${row.id}">Hapus</button></td></tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada unit yang cocok.</td></tr>';
   setText('#unit-count-page', filtered.length);
   setText('#unit-available-page', rows.filter((row) => row.status === 'Tersedia').length);
   setText('#unit-rented-page', rows.filter((row) => row.status === 'Disewa').length);
@@ -1185,12 +514,11 @@ function renderUnits(rows = state.units) {
 }
 function renderPriceList(rows = state.units) {
   const target = $('#price-list'); if (!target) return;
-  target.innerHTML = rows.length ? rows.map((row) => `<article class="price-item"><div class="price-item-icon"><i data-lucide="gamepad-2" aria-hidden="true"></i></div><div class="price-item-main"><b>Tarif ${escapeHtml(row.tipe_konsol)}</b><small>Berlaku untuk semua unit ${escapeHtml(row.tipe_konsol)}</small></div><label class="console-rate-control"><span>Tarif per jam</span><input data-tariff-input="${row.tipe_konsol}" type="number" min="1" step="1000" value="${Number(row.tarif_per_jam)}" aria-label="Tarif ${row.tipe_konsol} per jam"></label><button type="button" class="secondary-btn console-rate-save" data-save-tariff="${row.tipe_konsol}"><i data-lucide="save" aria-hidden="true"></i>Simpan</button></article>`).join('') : '<div class="empty">Tarif konsol belum tersedia.</div>';
+  target.innerHTML = rows.length ? rows.map((row) => `<article class="price-item"><div class="price-item-icon"><i data-lucide="gamepad-2" aria-hidden="true"></i></div><div class="price-item-main"><b>${escapeHtml(row.nama_unit)}</b><small>${escapeHtml(row.kode_unit)} · ${escapeHtml(row.tipe_konsol)}</small></div><strong>${formatRupiah(row.tarif_per_jam)}<small>/ jam</small></strong></article>`).join('') : '<div class="empty">Belum ada unit untuk ditampilkan.</div>';
   refreshIcons();
 }
-async function loadUnits() { try { [state.units, state.tariffs] = await Promise.all([api('/api/units'), api('/api/tariffs')]); renderUnits(); renderPriceList(state.tariffs); } catch (error) { showToast(error.message, 'error'); } }
-async function saveUnit(event) { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.currentTarget).entries()); try { await api('/api/units', { method: 'POST', body: JSON.stringify(payload) }); modalControl('unit-modal', false); event.currentTarget.reset(); showToast('Unit berhasil ditambahkan.'); await loadUnits(); } catch (error) { showToast(error.message, 'error'); } }
-async function saveConsoleTariff(type) { const amount = Number($(`[data-tariff-input="${type}"]`)?.value); if (!Number.isFinite(amount) || amount <= 0) { showToast('Tarif per jam harus lebih dari nol.', 'error'); return; } try { await api(`/api/tariffs/${type}`, { method: 'PATCH', body: JSON.stringify({ tarif_per_jam: amount }) }); showToast(`Tarif ${type} berhasil diperbarui.`); await loadUnits(); } catch (error) { showToast(error.message, 'error'); } }
+async function loadUnits() { try { state.units = await api('/api/units'); renderUnits(); } catch (error) { showToast(error.message, 'error'); } }
+async function saveUnit(event) { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.currentTarget).entries()); payload.tarif_per_jam = Number(payload.tarif_per_jam); try { await api('/api/units', { method: 'POST', body: JSON.stringify(payload) }); modalControl('unit-modal', false); event.currentTarget.reset(); showToast('Unit berhasil ditambahkan.'); await loadUnits(); } catch (error) { showToast(error.message, 'error'); } }
 
 function renderCustomers(rows = state.customers) { const target = $('#customer-list'); if (!target) return; const query = ($('#customer-search')?.value || '').toLowerCase(); const filtered = rows.filter((row) => [row.nama, row.email, row.nomor_telepon].some((value) => String(value || '').toLowerCase().includes(query))); target.innerHTML = filtered.length ? filtered.map((row) => `<tr><td><b>${escapeHtml(row.nama)}</b></td><td>${escapeHtml(row.nomor_telepon || '-')}</td><td>${escapeHtml(row.email || '-')}</td><td>${row.aktif ? statusBadge('Aktif') : statusBadge('Nonaktif')}</td><td><button class="icon-btn customer-history" data-id="${row.id}">Riwayat</button><button class="icon-btn edit-customer" data-id="${row.id}">Edit</button><button class="icon-btn danger delete-customer" data-id="${row.id}">Hapus</button></td></tr>`).join('') : '<tr><td colspan="5" class="empty">Belum ada pelanggan.</td></tr>'; setText('#customer-count-page', filtered.length); }
 async function loadCustomers() { try { state.customers = await api('/api/customers'); renderCustomers(); } catch (error) { showToast(error.message, 'error'); } }
@@ -1205,6 +533,24 @@ async function savePayment(event) { event.preventDefault(); const payload = Obje
 function renderReport(rows) { const total = rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0); const paid = rows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0); setText('#report-count', rows.length); setText('#report-total', formatRupiah(total)); setText('#report-paid', formatRupiah(paid)); setText('#report-receivable', formatRupiah(Math.max(total - paid, 0))); const target = $('#report-list'); if (target) target.innerHTML = rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.kode_penyewaan)}</td><td>${formatDateOnly(row.mulai_sewa)}</td><td>${escapeHtml(row.nama_pelanggan)}</td><td>${escapeHtml(row.kode_unit)}</td><td>${formatRupiah(row.total_biaya)}</td><td>${formatRupiah(row.jumlah_bayar)}</td><td>${formatRupiah(row.piutang)}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada data pada periode ini.</td></tr>'; }
 async function loadReport() { try { const query = `?period=${state.period}${state.period === 'custom' ? getCustomQuery() : ''}`; renderReport(await api(`/api/report${query}`)); } catch (error) { showToast(error.message, 'error'); } }
 
+function renderPackages(rows) {
+  const target = $('#package-list');
+  if (!target) return;
+  const query = ($('#package-search')?.value || '').toLowerCase();
+  const filtered = rows.filter((row) => row.tipe_konsol.toLowerCase().includes(query));
+  const rates = rows.map((row) => Number(row.tarif_per_jam));
+  target.innerHTML = filtered.length ? filtered.map((row) => `<article class="price-item"><div class="price-item-icon"><i data-lucide="gamepad-2" aria-hidden="true"></i></div><div class="price-item-main"><b>Paket ${escapeHtml(row.tipe_konsol)}</b><small>Sewa konsol per jam</small></div><strong>${formatRupiah(row.tarif_per_jam)}<small>/ jam</small></strong></article>`).join('') : '<div class="empty">Tidak ada paket yang cocok.</div>';
+  setText('#package-total', rows.length);
+  setText('#package-min', formatRupiah(rates.length ? Math.min(...rates) : 0));
+  setText('#package-max', formatRupiah(rates.length ? Math.max(...rates) : 0));
+  setText('#package-average', formatRupiah(rates.length ? rates.reduce((sum, rate) => sum + rate, 0) / rates.length : 0));
+  refreshIcons();
+}
+async function loadPackages() {
+  try { renderPackages(await api('/api/tariffs')); }
+  catch (error) { showToast(error.message, 'error'); }
+}
+
 async function editRental(id) {
   const row = state.rentals.find((item) => item.id === id); if (!row) return;
   const duration = window.prompt('Durasi rental (jam):', row.durasi_jam); if (duration === null) return;
@@ -1214,10 +560,9 @@ async function editRental(id) {
 async function editUnit(id) {
   const row = state.units.find((item) => item.id === id); if (!row) return;
   const name = window.prompt('Nama unit:', row.nama_unit); if (name === null) return;
-  const consoleType = window.prompt('Tipe konsol (PS4 atau PS5):', row.tipe_konsol); if (consoleType === null) return;
+  const rate = window.prompt('Tarif per jam:', row.tarif_per_jam); if (rate === null) return;
   const status = window.prompt('Status: Tersedia, Disewa, atau Perawatan:', row.status); if (status === null) return;
-  const note = window.prompt('Catatan unit:', row.catatan || ''); if (note === null) return;
-  try { await api(`/api/units/${id}`, { method: 'PATCH', body: JSON.stringify({ nama_unit: name, tipe_konsol: consoleType.trim().toUpperCase(), status, catatan: note }) }); showToast('Unit berhasil diperbarui.'); await loadUnits(); } catch (error) { showToast(error.message, 'error'); }
+  try { await api(`/api/units/${id}`, { method: 'PATCH', body: JSON.stringify({ nama_unit: name, tarif_per_jam: Number(rate), status }) }); showToast('Unit berhasil diperbarui.'); await loadUnits(); } catch (error) { showToast(error.message, 'error'); }
 }
 async function editCustomer(id) {
   const row = state.customers.find((item) => item.id === id); if (!row) return;
@@ -1236,7 +581,6 @@ function bindCommon() {
     if (button.id === 'open-unit') modalControl('unit-modal', true);
     if (button.id === 'open-customer') modalControl('customer-modal', true);
     if (button.id === 'open-payment') modalControl('payment-modal', true);
-    if (button.dataset.saveTariff) saveConsoleTariff(button.dataset.saveTariff);
     if (button.id === 'refresh-page') pageName === 'dashboard' ? loadDashboard() : pageName === 'rentals' ? loadRentals() : pageName === 'units' ? loadUnits() : pageName === 'customers' ? loadCustomers() : pageName === 'payments' ? loadPayments() : loadReport();
     if (button.classList.contains('detail-rental')) showRentalDetail(button.dataset.id);
     if (button.classList.contains('edit-rental')) editRental(button.dataset.id);
@@ -1252,31 +596,37 @@ function bindCommon() {
   });
   document.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => modalControl(button.dataset.close, false)));
   $('#rental-form')?.addEventListener('submit', saveRental); $('#unit-form')?.addEventListener('submit', saveUnit); $('#customer-form')?.addEventListener('submit', saveCustomer); $('#payment-form')?.addEventListener('submit', savePayment);
-  $('#rental-unit')?.addEventListener('change', updateRentalEstimate); $('#rental-room')?.addEventListener('change', updateRentalEstimate); $('#rental-form [name="durasi_jam"]')?.addEventListener('input', updateRentalEstimate);
   $('#rental-search')?.addEventListener('input', () => renderRentals()); $('#rental-status')?.addEventListener('change', () => renderRentals()); $('#unit-search')?.addEventListener('input', () => renderUnits()); $('#unit-status-filter')?.addEventListener('change', () => renderUnits()); $('#customer-search')?.addEventListener('input', () => renderCustomers()); $('#payment-search')?.addEventListener('input', () => renderPayments());
-  document.querySelectorAll('[data-period]').forEach((button) => button.addEventListener('click', () => { state.period = button.dataset.period; document.querySelectorAll('[data-period]').forEach((item) => item.classList.toggle('active', item === button)); pageName === 'dashboard' ? loadDashboard() : loadReport(); }));
-  $('#custom-period')?.addEventListener('change', () => { if ($('#custom-start')?.value && $('#custom-end')?.value) { state.period = 'custom'; pageName === 'dashboard' ? loadDashboard() : loadReport(); } });
+  document.querySelectorAll('[data-period]').forEach((button) => button.addEventListener('click', () => {
+    state.period = button.dataset.period;
+    document.querySelectorAll('[data-period]').forEach((item) => item.classList.toggle('active', item === button));
+    if (state.period === 'custom') return;
+    state.chartPeriod = state.period;
+    if (pageName === 'dashboard') loadDashboard(); else loadReport();
+  }));
+  $('#custom-period')?.addEventListener('change', () => {
+    if ($('#custom-start')?.value && $('#custom-end')?.value) {
+      state.period = 'custom';
+      state.chartPeriod = 'custom';
+      document.querySelectorAll('[data-period]').forEach((item) => item.classList.toggle('active', item.dataset.period === 'custom'));
+      if (pageName === 'dashboard') loadDashboard(); else loadReport();
+    }
+  });
+  $('#package-search')?.addEventListener('input', () => loadPackages());
 }
 async function start() {
   document.title = document.title.replace('PlayLedger', 'PlayVora');
-  if (!document.querySelector('link[rel="icon"]')) {
-    const favicon = document.createElement('link');
-    favicon.rel = 'icon';
-    favicon.type = 'image/svg+xml';
-    favicon.href = 'favicon.svg';
-    document.head.appendChild(favicon);
-  }
   document.querySelectorAll('.eyebrow').forEach((element) => { element.textContent = element.textContent.replace('PlayLedger', 'PlayVora'); });
-  if (pageName === 'dashboard') document.querySelector('h1')?.replaceChildren('Dashboard');
+  if (pageName === 'dashboard') document.querySelector('h1')?.replaceChildren('Dashboard Pendapatan');
   if (pageName === 'dashboard') document.querySelector('.hero-badge')?.replaceChildren('PlayVora Analytics');
   document.querySelectorAll('#refresh-page').forEach((button) => { button.innerHTML = '<i data-lucide="refresh-cw" aria-hidden="true"></i>'; button.title = 'Refresh Data'; button.setAttribute('aria-label', 'Refresh Data'); });
-  if (pageName === 'units') prepareUnitForm();
-  applyNav(); ensureDashboardPeriodControls(); bindCommon();
+  applyNav(); ensurePeriodControls(); bindCommon();
   if (pageName === 'dashboard') await loadDashboard();
   if (pageName === 'rentals') await loadRentals();
   if (pageName === 'units') await loadUnits();
   if (pageName === 'customers') { await loadCustomers(); await loadRentals(); }
   if (pageName === 'payments') await loadPayments();
   if (pageName === 'reports') await loadReport();
+  if (pageName === 'paket') await loadPackages();
 }
 start();
