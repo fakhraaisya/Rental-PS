@@ -1,5 +1,5 @@
 const pageName = document.body.dataset.page || 'dashboard';
-const state = { customers: [], units: [], rentals: [], payments: [], period: 'month', chartPeriod: '7', dashboard: null, pendingDelete: null, revenueChart: null, chartJsPromise: null };
+const state = { customers: [], units: [], rentals: [], payments: [], period: 'month', chartPeriod: '7', dashboard: null, pendingDelete: null, revenueChart: null, chartJsPromise: null, dashboardRequest: 0, reportRequest: 0 };
 const SUPABASE_URL = 'https://clxskbmlsaunjixybzst.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_tZ_WeABf_RthbLNkLGza4g_GXuQP9hL';
 const $ = (selector) => document.querySelector(selector);
@@ -51,7 +51,7 @@ function periodBounds(params) {
   const now = new Date();
   const start = new Date(now);
   const end = new Date(now);
-  if (period === 'all') return { start: new Date(0), end };
+  if (period === 'all') return { start: new Date(0), end: new Date(8640000000000000) };
   if (period === 'today') start.setHours(0, 0, 0, 0);
   else if (period === 'week') {
     const day = start.getDay() || 7;
@@ -71,8 +71,16 @@ function periodBounds(params) {
   return { start, end };
 }
 function inPeriod(value, bounds) {
-  const date = new Date(value);
+  const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value);
   return !Number.isNaN(date.getTime()) && date >= bounds.start && date <= bounds.end;
+}
+function summarizeFinancials(rows) {
+  const totalBilled = rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0);
+  const totalPaid = rows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0);
+  const totalReceivable = rows.reduce((sum, row) => sum + Math.max(Number(row.total_biaya || 0) - Number(row.jumlah_bayar || 0), 0), 0);
+  return { totalBilled, totalPaid, totalReceivable };
 }
 function paymentStatus(total, paid) {
   if (paid <= 0) return 'Belum Lunas';
@@ -95,11 +103,7 @@ async function getDashboard(params) {
   ]);
   const bounds = periodBounds(params);
   const rows = allRows.filter((row) => inPeriod(row.mulai_sewa, bounds));
-  const paidRows = allRows.filter((row) => Number(row.jumlah_bayar || 0) > 0 && inPeriod(row.tanggal_bayar, bounds));
-  const totalBilled = rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0);
-  const totalPaid = paidRows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0);
-  const paidForPeriodBillings = rows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0);
-  const totalReceivable = rows.reduce((sum, row) => sum + Number(row.piutang || 0), 0);
+  const { totalBilled, totalPaid, totalReceivable } = summarizeFinancials(rows);
   const consoleMap = {};
   const paymentMap = {};
   const customerMap = {};
@@ -108,7 +112,7 @@ async function getDashboard(params) {
     consoleMap[row.tipe_konsol] = (consoleMap[row.tipe_konsol] || 0) + billed;
     customerMap[row.nama_pelanggan] = (customerMap[row.nama_pelanggan] || 0) + billed;
   });
-  paidRows.forEach((row) => {
+  rows.forEach((row) => {
     if (row.metode_pembayaran) paymentMap[row.metode_pembayaran] = (paymentMap[row.metode_pembayaran] || 0) + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0));
   });
   const summarize = (map) => Object.entries(map).map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount);
@@ -119,7 +123,7 @@ async function getDashboard(params) {
     activeSessions: rows.filter((row) => row.status === 'Berlangsung'),
     totalHours: rows.reduce((sum, row) => sum + Number(row.durasi_jam || 0), 0),
     averageTransaction: rows.length ? totalBilled / rows.length : 0,
-    paymentRate: totalBilled ? Math.round((paidForPeriodBillings / totalBilled) * 100) : 0,
+    paymentRate: totalBilled ? Math.round((totalPaid / totalBilled) * 100) : 0,
     unitSummary: {
       available: units.filter((item) => item.status === 'Tersedia').length,
       rented: units.filter((item) => item.status === 'Disewa').length,
@@ -442,8 +446,15 @@ function renderBreakdown(selector, rows) {
     target.innerHTML = rows.length ? rows.map((row, index) => `<div class="insight-row"><div><b><span class="rank">0${index + 1}</span> ${escapeHtml(row.name)}</b><small>Pelanggan aktif</small></div><strong>${formatRupiah(row.amount)}</strong></div>`).join('') : '<div class="empty">Belum ada aktivitas pelanggan.</div>';
   }
 async function loadDashboard() {
+  const requestId = ++state.dashboardRequest;
   const query = `?period=${state.period}${state.period === 'custom' ? getCustomQuery() : ''}`;
-  try { await renderDashboard(await api(`/api/dashboard${query}`)); } catch (error) { showToast(error.message, 'error'); }
+  try {
+    const data = await api(`/api/dashboard${query}`);
+    if (requestId !== state.dashboardRequest) return;
+    await renderDashboard(data);
+  } catch (error) {
+    if (requestId === state.dashboardRequest) showToast(error.message, 'error');
+  }
 }
 function ensurePeriodControls() {
   if (!['dashboard', 'reports'].includes(pageName)) return;
@@ -530,8 +541,21 @@ async function loadPayments() { try { state.payments = await api('/api/payments'
 function openPaymentModal(id, code) { $('#payment-rental-id').value = id; $('#payment-rental-code').textContent = code; modalControl('payment-modal', true); }
 async function savePayment(event) { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.currentTarget).entries()); payload.jumlah_bayar = Number(payload.jumlah_bayar); try { await api('/api/payments', { method: 'POST', body: JSON.stringify(payload) }); modalControl('payment-modal', false); event.currentTarget.reset(); showToast('Pembayaran berhasil dicatat.'); await loadPayments(); } catch (error) { showToast(error.message, 'error'); } }
 
-function renderReport(rows) { const total = rows.reduce((sum, row) => sum + Number(row.total_biaya || 0), 0); const paid = rows.reduce((sum, row) => sum + Math.min(Number(row.jumlah_bayar || 0), Number(row.total_biaya || 0)), 0); setText('#report-count', rows.length); setText('#report-total', formatRupiah(total)); setText('#report-paid', formatRupiah(paid)); setText('#report-receivable', formatRupiah(Math.max(total - paid, 0))); const target = $('#report-list'); if (target) target.innerHTML = rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.kode_penyewaan)}</td><td>${formatDateOnly(row.mulai_sewa)}</td><td>${escapeHtml(row.nama_pelanggan)}</td><td>${escapeHtml(row.kode_unit)}</td><td>${formatRupiah(row.total_biaya)}</td><td>${formatRupiah(row.jumlah_bayar)}</td><td>${formatRupiah(row.piutang)}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada data pada periode ini.</td></tr>'; }
-async function loadReport() { try { const query = `?period=${state.period}${state.period === 'custom' ? getCustomQuery() : ''}`; renderReport(await api(`/api/report${query}`)); } catch (error) { showToast(error.message, 'error'); } }
+function renderReport(rows) { const { totalBilled, totalPaid, totalReceivable } = summarizeFinancials(rows); setText('#report-count', rows.length); setText('#report-total', formatRupiah(totalBilled)); setText('#report-paid', formatRupiah(totalPaid)); setText('#report-receivable', formatRupiah(totalReceivable)); const target = $('#report-list'); if (target) target.innerHTML = rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.kode_penyewaan)}</td><td>${formatDateOnly(row.mulai_sewa)}</td><td>${escapeHtml(row.nama_pelanggan)}</td><td>${escapeHtml(row.kode_unit)}</td><td>${formatRupiah(row.total_biaya)}</td><td>${formatRupiah(row.jumlah_bayar)}</td><td>${formatRupiah(row.piutang)}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada transaksi pada periode ini.</td></tr>'; }
+async function loadReport() {
+  const requestId = ++state.reportRequest;
+  try {
+    const query = `?period=${state.period}${state.period === 'custom' ? getCustomQuery() : ''}`;
+    const rows = await api(`/api/report${query}`);
+    if (requestId === state.reportRequest) renderReport(rows);
+  } catch (error) {
+    if (requestId !== state.reportRequest) return;
+    const target = $('#report-list');
+    if (target) target.innerHTML = `<tr><td colspan="7" class="empty">Gagal memuat laporan: ${escapeHtml(error.message)}</td></tr>`;
+    ['#report-count', '#report-total', '#report-paid', '#report-receivable'].forEach((selector) => setText(selector, '—'));
+    showToast(error.message, 'error');
+  }
+}
 
 function renderPackages(rows) {
   const target = $('#package-list');
